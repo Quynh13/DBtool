@@ -1,0 +1,48 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}
+Rollback operation
+{% endblock %}
+
+{% block content %}
+
+<h1>Rollback operation</h1>
+
+<p>
+  <strong>Operation:</strong>
+  {{ operation.id }}
+</p>
+
+<p>
+  <strong>Action:</strong>
+  {{ operation.action }}
+</p>
+
+<p>
+  <strong>Table:</strong>
+  {{ operation.schema_name }}.{{ operation.table_name }}
+</p>
+
+<p>
+  <strong>Status:</strong>
+  {{ operation.status }}
+</p>
+
+<p>
+  The rollback will proceed only if the current
+  PostgreSQL row still matches the saved safe state.
+</p>
+
+<form method="post">
+  {% csrf_token %}
+
+  <div class="submit-row">
+    <input
+      type="submit"
+      value="Rollback"
+      class="default"
+    >
+  </div>
+</form>
+
+{% endblock %}

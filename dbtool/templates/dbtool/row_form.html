@@ -1,0 +1,58 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}
+{{ mode }} row
+{% endblock %}
+
+{% block content %}
+
+<p>
+  <a href="{% url 'dbtool:table_detail' definition.schema definition.name %}">
+    ← Back to table
+  </a>
+</p>
+
+<h1>
+  {{ mode }} row:
+  {{ definition.schema }}.{{ definition.name }}
+</h1>
+
+<form method="post">
+  {% csrf_token %}
+  <input type="hidden" name="state_token" value="{{ state_token }}">
+  {{ form.non_field_errors }}
+
+  <fieldset class="module aligned">
+
+    {% for field in form %}
+
+    <div class="form-row">
+      {{ field.errors }}
+
+      <div>
+        {{ field.label_tag }}
+        {{ field }}
+
+        {% if field.help_text %}
+        <div class="help">
+          {{ field.help_text }}
+        </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% endfor %}
+
+  </fieldset>
+
+  <div class="submit-row">
+    <input
+      type="submit"
+      value="Save"
+      class="default"
+    >
+  </div>
+
+</form>
+
+{% endblock %}

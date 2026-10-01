@@ -1,0 +1,77 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}
+Database Tables
+{% endblock %}
+
+{% block content %}
+
+<h1>Database Tables</h1>
+
+<p>
+    Target database tables detected automatically from PostgreSQL metadata.
+</p>
+
+<div class="module">
+
+    <table style="width: 100%;">
+        <thead>
+            <tr>
+                <th>Schema</th>
+                <th>Table</th>
+                <th>Type</th>
+                <th>Primary Key</th>
+                <th>Safety</th>
+            </tr>
+        </thead>
+
+        <tbody>
+
+            {% for table in tables %}
+
+            <tr>
+                <td>
+                    {{ table.schema }}
+                </td>
+
+                <td>
+                    <a href="{% url 'dbtool:table_detail' table.schema table.name %}">
+                        {{ table.name }}
+                    </a>
+                </td>
+
+                <td>
+                    {{ table.type }}
+                </td>
+
+                <td>
+                    {% if table.primary_key %}
+                        {{ table.primary_key|join:", " }}
+                    {% else %}
+                        —
+                    {% endif %}
+                </td>
+
+                <td>
+                    <strong>
+                        {{ table.safety }}
+                    </strong>
+                </td>
+            </tr>
+
+            {% empty %}
+
+            <tr>
+                <td colspan="5">
+                    No tables found.
+                </td>
+            </tr>
+
+            {% endfor %}
+
+        </tbody>
+    </table>
+
+</div>
+
+{% endblock %}

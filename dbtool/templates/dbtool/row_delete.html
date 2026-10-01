@@ -1,0 +1,57 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}
+Delete row
+{% endblock %}
+
+{% block content %}
+
+<p>
+  <a href="{% url 'dbtool:table_detail' definition.schema definition.name %}">
+    ← Back to table
+  </a>
+</p>
+
+<h1>
+  Delete row:
+  {{ definition.schema }}.{{ definition.name }}
+</h1>
+
+<p>
+  Are you sure you want to delete this row?
+</p>
+
+<div class="module">
+  <table>
+    <tbody>
+
+      {% for item in display_values %}
+      <tr>
+        <th>{{ item.name }}</th>
+        <td>{{ item.value }}</td>
+      </tr>
+      {% endfor %}
+
+    </tbody>
+  </table>
+</div>
+
+<form method="post">
+  {% csrf_token %}
+
+  <input
+    type="hidden"
+    name="state_token"
+    value="{{ state_token }}"
+  >
+
+  <div class="submit-row">
+    <input
+      type="submit"
+      value="Delete"
+      class="deletelink"
+    >
+  </div>
+</form>
+
+{% endblock %}

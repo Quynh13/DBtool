@@ -1,0 +1,198 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}
+{{ definition.schema }}.{{ definition.name }}
+{% endblock %}
+
+{% block extrahead %}
+{{ block.super }}
+
+<style>
+  .dbtool-table-container {
+    overflow-x: auto;
+    max-width: 100%;
+  }
+
+  .dbtool-data-table {
+    border-collapse: collapse;
+    min-width: 100%;
+    white-space: nowrap;
+  }
+
+  .dbtool-data-table th,
+  .dbtool-data-table td {
+    padding: 8px 10px;
+    border-bottom: 1px solid var(--hairline-color);
+    max-width: 350px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+
+  .dbtool-warning {
+    padding: 10px;
+    margin: 10px 0;
+    background: var(--darkened-bg);
+  }
+
+  .dbtool-meta {
+    margin-bottom: 20px;
+  }
+</style>
+{% endblock %}
+
+{% block content %}
+
+<p>
+  <a href="{% url 'dbtool:table_list' %}">← Back to tables</a>
+</p>
+
+<h1>{{ definition.schema }}.{{ definition.name }}</h1>
+
+{% if capabilities.can_insert %}
+<p>
+  <a class="button" href="{% url 'dbtool:row_add' definition.schema definition.name %}">
+    Add Row
+  </a>
+</p>
+{% endif %}
+
+<div class="dbtool-meta">
+  <p>
+    <strong>Type:</strong>
+    {{ definition.table_type }}
+  </p>
+
+  <p>
+    <strong>Safety:</strong>
+    {{ safety }}
+  </p>
+
+  <p>
+    <strong>Primary key:</strong>
+    {{ primary_key_display }}
+  </p>
+
+  <p>
+    <strong>Total rows:</strong>
+    {{ total_rows }}
+  </p>
+</div>
+
+<h2>Warnings</h2>
+
+<div>
+{% for warning in capabilities.warnings %}
+  <div class="dbtool-warning">
+    ⚠ {{ warning }}
+  </div>
+{% empty %}
+  <p>No table-level warnings.</p>
+{% endfor %}
+</div>
+
+<h2>Columns</h2>
+
+<div class="module">
+  <table style="width: 100%;">
+    <thead>
+      <tr>
+        <th>Column</th>
+        <th>Type</th>
+        <th>Nullable</th>
+        <th>PK</th>
+        <th>Insert</th>
+        <th>Update</th>
+        <th>Notes</th>
+      </tr>
+    </thead>
+
+    <tbody>
+    {% for item in column_rows %}
+      <tr>
+        <td>{{ item.column.name }}</td>
+        <td>{{ item.column.data_type }}</td>
+        <td>{{ item.nullable_display }}</td>
+        <td>{{ item.pk_display }}</td>
+        <td>{{ item.insert_display }}</td>
+        <td>{{ item.update_display }}</td>
+        <td>{{ item.warning_display }}</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<h2>Rows</h2>
+
+<div class="dbtool-table-container">
+  <table class="dbtool-data-table">
+    <thead>
+      <tr>
+        {% for column in definition.columns %}
+        <th>{{ column.name }}</th>
+        {% endfor %}
+        <th>Actions</th>
+      </tr>
+    </thead>
+
+    <tbody>
+      {% for row in rows %}
+      <tr>
+
+        {% for value in row.values %}
+        <td title="{{ value }}">
+          {{ value }}
+        </td>
+        {% endfor %}
+
+        <td>
+          {% if row.row_token %}
+
+            {% if capabilities.can_update %}
+            <a href="{% url 'dbtool:row_edit' definition.schema definition.name row.row_token %}">
+              Edit
+            </a>
+            {% endif %}
+
+            {% if capabilities.can_delete %}
+            &nbsp;
+            <a href="{% url 'dbtool:row_delete' definition.schema definition.name row.row_token %}">
+              Delete
+            </a>
+            {% endif %}
+
+          {% else %}
+            —
+          {% endif %}
+        </td>
+
+      </tr>
+
+      {% empty %}
+
+      <tr>
+        <td colspan="{{ column_count }}">
+          No records found.
+        </td>
+      </tr>
+
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+
+<p style="margin-top: 20px;">
+  {{ pagination_display }}
+</p>
+
+{% if has_previous %}
+<a href="?page={{ previous_page }}">← Previous</a>
+{% endif %}
+
+&nbsp;
+
+{% if has_next %}
+<a href="?page={{ next_page }}">Next →</a>
+{% endif %}
+
+{% endblock %}
