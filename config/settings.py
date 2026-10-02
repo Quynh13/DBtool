@@ -21,12 +21,28 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 # See https://docs.djangoproject.com/en/6.1/howto/deployment/checklist/
 
 # SECURITY WARNING: keep the secret key used in production secret!
-SECRET_KEY = "django-insecure-&=ub_dnso==i4e=g6cy$1%11k^yjvu+rfm7etbv-g)$wywxt@("
+SECRET_KEY = os.environ.get(
+    "DJANGO_SECRET_KEY",
+    "dev-only-secret-key",
+)
 
 # SECURITY WARNING: don't run with debug turned on in production!
-DEBUG = True
+DEBUG = (
+    os.environ.get(
+        "DJANGO_DEBUG",
+        "True",
+    ).lower()
+    == "true"
+)
 
-ALLOWED_HOSTS = []
+ALLOWED_HOSTS = [
+    host.strip()
+    for host in os.environ.get(
+        "DJANGO_ALLOWED_HOSTS",
+        "127.0.0.1,localhost",
+    ).split(",")
+    if host.strip()
+]
 
 
 # Application definition
@@ -44,6 +60,7 @@ INSTALLED_APPS = [
 
 MIDDLEWARE = [
     "django.middleware.security.SecurityMiddleware",
+    "whitenoise.middleware.WhiteNoiseMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",
     "django.middleware.common.CommonMiddleware",
     "django.middleware.csrf.CsrfViewMiddleware",
@@ -78,7 +95,10 @@ WSGI_APPLICATION = "config.wsgi.application"
 DATABASES = {
     "default": {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": BASE_DIR / "db.sqlite3",
+        "NAME": os.environ.get(
+            "TOOL_DB_PATH",
+            BASE_DIR / "db.sqlite3",
+        ),
     },
     "target": {
         "ENGINE": "django.db.backends.postgresql",
@@ -86,7 +106,10 @@ DATABASES = {
         "USER": os.environ["TARGET_DB_USER"],
         "PASSWORD": os.environ["TARGET_DB_PASSWORD"],
         "HOST": os.environ["TARGET_DB_HOST"],
-        "PORT": os.environ.get("TARGET_DB_PORT", "5432"),
+        "PORT": os.environ.get(
+            "TARGET_DB_PORT",
+            "5432",
+        ),
     },
 }
 
@@ -125,14 +148,23 @@ USE_TZ = True
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/6.1/howto/static-files/
 
-STATIC_URL = "static/"
-
-
 # Email
 # https://docs.djangoproject.com/en/6.1/topics/email/#topic-email-configuration
 
 MAILERS = {
     "default": {
         "BACKEND": "django.core.mail.backends.console.EmailBackend",
+    },
+}
+
+STATIC_URL = "static/"
+STATIC_ROOT = BASE_DIR / "staticfiles"
+
+STORAGES = {
+    "default": {
+        "BACKEND": "django.core.files.storage.FileSystemStorage",
+    },
+    "staticfiles": {
+        "BACKEND": ("whitenoise.storage.CompressedManifestStaticFilesStorage"),
     },
 }
