@@ -8,11 +8,10 @@ metadata:
     nginx.ingress.kubernetes.io/proxy-body-size: "50m"
     nginx.ingress.kubernetes.io/proxy-read-timeout: "120"
     nginx.ingress.kubernetes.io/proxy-send-timeout: "120"
-    # cert-manager.io/cluster-issuer: "letsencrypt-prod" # Bỏ comment nếu dùng cert-manager cấp SSL tự động
 spec:
   ingressClassName: nginx
   rules:
-    - host: tool.example.com
+    - host: cki-tool.acv.local
       http:
         paths:
           - path: /
@@ -24,5 +23,5 @@ spec:
                   number: 80
   # tls:
   #   - hosts:
-  #       - tool.example.com
-  #     secretName: django-tls-secret
+  #       - cki-tool.acv.local
+  #     secretName: cki-tool-tls

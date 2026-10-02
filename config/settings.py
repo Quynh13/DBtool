@@ -44,6 +44,24 @@ ALLOWED_HOSTS = [
     if host.strip()
 ]
 
+# Lấy danh sách CSRF Trusted Origins từ biến môi trường (phân tách bởi dấu phẩy)
+_csrf_origins = os.environ.get("DJANGO_CSRF_TRUSTED_ORIGINS", "")
+CSRF_TRUSTED_ORIGINS = [
+    origin.strip()
+    for origin in _csrf_origins.split(",")
+    if origin.strip()
+]
+
+# Cấu hình proxy headers từ biến môi trường
+if os.environ.get("DJANGO_SECURE_PROXY_SSL_HEADER", "True").lower() == "true":
+    SECURE_PROXY_SSL_HEADER = ("HTTP_X_FORWARDED_PROTO", "https")
+else:
+    SECURE_PROXY_SSL_HEADER = None
+
+USE_X_FORWARDED_HOST = (
+    os.environ.get("DJANGO_USE_X_FORWARDED_HOST", "True").lower() == "true"
+)
+
 
 # Application definition
 
