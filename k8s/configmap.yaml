@@ -1,0 +1,13 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: django-config
+  namespace: sac-tool
+data:
+  DJANGO_DEBUG: "False"
+  DJANGO_ALLOWED_HOSTS: "*"
+  TOOL_DB_PATH: "/data/db.sqlite3"
+  TARGET_DB_HOST: "postgres-service"
+  TARGET_DB_PORT: "5432"
+  TARGET_DB_NAME: "sac_db"
+  TARGET_DB_USER: "postgres"

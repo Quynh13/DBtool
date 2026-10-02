@@ -1,0 +1,137 @@
+name: Build and Deploy to K3s
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - 'README.md'
+      - 'GITEA_CICD_GUIDE.md'
+      - 'docs/**'
+  workflow_dispatch:
+
+env:
+  # Registry nội bộ (tương tự như các service sac-api, sac-portal, sac-collector)
+  REGISTRY: "10.10.74.67:5000"
+  IMAGE_NAME: "sac-tool"
+  NAMESPACE: "sac-tool"
+
+jobs:
+  # -----------------------------------------------------------
+  # 1. Kiểm tra mã nguồn (Lint / Django check)
+  # -----------------------------------------------------------
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install uv and dependencies
+        run: |
+          pip install --no-cache-dir uv
+          uv sync --frozen --no-dev --no-install-project
+
+      - name: Validate Django configuration
+        env:
+          TARGET_DB_NAME: "dummy_db"
+          TARGET_DB_USER: "dummy_user"
+          TARGET_DB_PASSWORD: "dummy_password"
+          TARGET_DB_HOST: "127.0.0.1"
+          DJANGO_SECRET_KEY: "ci-test-key"
+          DJANGO_DEBUG: "True"
+        run: |
+          source .venv/bin/activate
+          python manage.py check
+
+  # -----------------------------------------------------------
+  # 2. Build & Push Docker Image
+  # -----------------------------------------------------------
+  build-and-push:
+    needs: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build and push Docker image
+        run: |
+          SHORT_SHA=$(echo ${{ gitea.sha }} | cut -c1-7)
+          TAG_SHA="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+          TAG_LATEST="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest"
+
+          echo "Building image: $TAG_SHA"
+          docker build -t $TAG_SHA -t $TAG_LATEST .
+
+          echo "Pushing image to registry ${{ env.REGISTRY }}..."
+          docker push $TAG_SHA
+          docker push $TAG_LATEST
+
+  # -----------------------------------------------------------
+  # 3. Deploy to K3s Cluster
+  # -----------------------------------------------------------
+  deploy-k8s:
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'latest'
+
+      - name: Configure Kubeconfig
+        run: |
+          if [ -n "${{ secrets.KUBE_CONFIG }}" ]; then
+            echo "Configuring KUBE_CONFIG from Gitea Secrets..."
+            mkdir -p $HOME/.kube
+            echo "${{ secrets.KUBE_CONFIG }}" > $HOME/.kube/config
+            chmod 600 $HOME/.kube/config
+          elif [ -n "${{ secrets.KUBECONFIG }}" ]; then
+            echo "Configuring KUBECONFIG from Gitea Secrets..."
+            mkdir -p $HOME/.kube
+            echo "${{ secrets.KUBECONFIG }}" > $HOME/.kube/config
+            chmod 600 $HOME/.kube/config
+          elif [ -f /var/run/secrets/kubernetes.io/serviceaccount/token ]; then
+            echo "Act Runner running inside K3s, using In-Cluster ServiceAccount."
+          else
+            echo "Error: Secret KUBE_CONFIG is not defined and not running inside cluster!"
+            exit 1
+          fi
+
+      - name: Verify Kubernetes Connection
+        run: |
+          kubectl cluster-info
+          kubectl get nodes
+
+      - name: Update Deployment Image & Rollout
+        run: |
+          SHORT_SHA=$(echo ${{ gitea.sha }} | cut -c1-7)
+          TARGET_IMAGE="${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SHORT_SHA}"
+
+          echo "Deploying image: $TARGET_IMAGE"
+
+          # Áp dụng các config cập nhật nếu có
+          kubectl apply -f k8s/configmap.yaml -n ${{ env.NAMESPACE }}
+          kubectl apply -f k8s/service.yaml -n ${{ env.NAMESPACE }}
+          kubectl apply -f k8s/ingress.yaml -n ${{ env.NAMESPACE }}
+
+          # Cập nhật image cho deployment
+          kubectl set image deployment/django-app django-app=${TARGET_IMAGE} -n ${{ env.NAMESPACE }}
+
+          # Chờ rollout hoàn tất
+          kubectl rollout status deployment/django-app -n ${{ env.NAMESPACE }} --timeout=180s
+
+      - name: Report Deployment Status
+        if: success()
+        run: |
+          echo "Deployment successful!"
+          kubectl get deployment django-app -n ${{ env.NAMESPACE }} -o wide
+          kubectl get pods -l app=django-app -n ${{ env.NAMESPACE }}
