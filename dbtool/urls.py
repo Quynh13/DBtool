@@ -14,6 +14,21 @@ urlpatterns = [
         name="table_list",
     ),
     path(
+        "configuration/",
+        admin.site.admin_view(views.database_configuration),
+        name="database_configuration",
+    ),
+    path(
+        "configuration/<str:schema>/<str:table>/release/",
+        admin.site.admin_view(views.table_release),
+        name="table_release",
+    ),
+    path(
+        "configuration/<str:schema>/<str:table>/unrelease/",
+        admin.site.admin_view(views.table_unrelease),
+        name="table_unrelease",
+    ),
+    path(
         "<str:schema>/<str:table>/add/",
         admin.site.admin_view(views.row_add),
         name="row_add",

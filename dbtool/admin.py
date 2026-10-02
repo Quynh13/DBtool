@@ -21,6 +21,7 @@ class TableProfileAdmin(admin.ModelAdmin):
     )
     list_filter = ("mutation_enabled",)
     search_fields = ("schema_name", "table_name", "display_label")
+    exclude = ("is_released",)
     inlines = (ColumnProfileInline,)
 
 

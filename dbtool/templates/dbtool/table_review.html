@@ -10,9 +10,22 @@
 </p>
 
 <h1>Review {{ definition.schema }}.{{ definition.name }}</h1>
-<p><strong>Current status:</strong> {{ status }}</p>
+<p><strong>Configuration status:</strong> {{ configuration_status }}</p>
+<p><strong>Release status:</strong> {{ release_status }}</p>
 <p><strong>Type:</strong> {{ definition.table_type }}</p>
 <p><strong>Primary key:</strong> {{ definition.primary_key|join:", "|default:"None" }}</p>
+
+{% if can_release %}
+<form method="post" action="{% url 'dbtool:table_release' definition.schema definition.name %}">
+  {% csrf_token %}
+  <button type="submit">Release</button>
+</form>
+{% elif can_unrelease %}
+<form method="post" action="{% url 'dbtool:table_unrelease' definition.schema definition.name %}">
+  {% csrf_token %}
+  <button type="submit">Unrelease</button>
+</form>
+{% endif %}
 
 <form method="post">
   {% csrf_token %}

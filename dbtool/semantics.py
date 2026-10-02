@@ -8,6 +8,9 @@ from dbtool.safety import ColumnCapability, SafetyPolicy, TableCapabilities
 READY = "READY"
 NEEDS_REVIEW = "NEEDS REVIEW"
 READ_ONLY = "READ ONLY"
+NOT_CONFIGURED = "NOT CONFIGURED"
+INCOMPLETE = "INCOMPLETE"
+COMPLETE = "COMPLETE"
 
 
 @dataclass(frozen=True)
@@ -35,6 +38,7 @@ class EffectiveTable:
     definition: TableDefinition
     profile: TableProfile | None
     status: str
+    configuration_status: str
     capabilities: TableCapabilities
     columns: dict[str, EffectiveColumn]
     warnings: list[str]
@@ -190,6 +194,15 @@ class EffectiveMetadataService:
             stale_names
         )
 
+        if not physically_mutable:
+            configuration_status = READ_ONLY
+        elif profile is None:
+            configuration_status = NOT_CONFIGURED
+        elif incomplete:
+            configuration_status = INCOMPLETE
+        else:
+            configuration_status = COMPLETE
+
         if not physically_mutable or (profile and not profile.mutation_enabled):
             status = READ_ONLY
         elif profile is None or incomplete:
@@ -197,7 +210,9 @@ class EffectiveMetadataService:
         else:
             status = READY
 
-        mutations_allowed = status == READY
+        mutations_allowed = (
+            status == READY and bool(profile and profile.is_released)
+        )
         effective_capabilities = TableCapabilities(
             can_read=True,
             can_insert=physical.can_insert and mutations_allowed,
@@ -225,6 +240,7 @@ class EffectiveMetadataService:
             definition=definition,
             profile=profile,
             status=status,
+            configuration_status=configuration_status,
             capabilities=effective_capabilities,
             columns=columns,
             warnings=warnings,

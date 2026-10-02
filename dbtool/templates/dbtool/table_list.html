@@ -35,14 +35,6 @@ Database Tables
                     {{ table.schema }}
                 </td>
                 <td>
-                    {% if table.safety == "NEEDS REVIEW" %}
-                        <a href="{% url 'dbtool:table_review' table.schema table.name %}">{{ table.action }}</a>
-                    {% else %}
-                        <a href="{% url 'dbtool:table_detail' table.schema table.name %}">{{ table.action }}</a>
-                    {% endif %}
-                </td>
-
-                <td>
                     <a href="{% url 'dbtool:table_detail' table.schema table.name %}">
                         {{ table.label }}
                     </a>
@@ -67,6 +59,10 @@ Database Tables
                     <strong>
                         {{ table.safety }}
                     </strong>
+                </td>
+
+                <td>
+                    <a href="{{ table.action_url }}">{{ table.action }}</a>
                 </td>
             </tr>
 

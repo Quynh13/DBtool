@@ -22,8 +22,12 @@ from dbtool.semantic_validation import (
     SemanticValidator,
 )
 from dbtool.semantics import (
+    COMPLETE,
+    INCOMPLETE,
     NEEDS_REVIEW,
+    NOT_CONFIGURED,
     READY,
+    READ_ONLY,
     EffectiveMetadataService,
 )
 from dbtool.safety import SafetyPolicy
@@ -41,6 +45,60 @@ class UrlRoutingTests(SimpleTestCase):
         self.assertEqual(
             reverse("dbtool:table_list"),
             "/admin/db-editor/",
+        )
+
+
+@override_settings(
+    STORAGES={
+        "default": {
+            "BACKEND": "django.core.files.storage.FileSystemStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+)
+class NavigationTests(TestCase):
+    def setUp(self):
+        self.root = get_user_model().objects.create_superuser(
+            username="root-nav",
+            email="root-nav@example.com",
+            password="password",
+        )
+        self.normal_user = get_user_model().objects.create_user(
+            username="staff-nav",
+            password="password",
+            is_staff=True,
+        )
+
+    def test_root_navigation_links_editor_configuration_and_logs(self):
+        self.client.force_login(self.root)
+
+        response = self.client.get(reverse("admin:index"))
+
+        self.assertContains(response, reverse("dbtool:table_list"))
+        self.assertContains(
+            response,
+            reverse("dbtool:database_configuration"),
+        )
+        self.assertContains(
+            response,
+            reverse("admin:audit_operationlog_changelist"),
+        )
+
+    def test_normal_user_only_sees_editor_navigation(self):
+        self.client.force_login(self.normal_user)
+
+        response = self.client.get(reverse("admin:index"))
+
+        self.assertContains(response, reverse("dbtool:table_list"))
+        self.assertNotContains(
+            response,
+            reverse("dbtool:database_configuration"),
+        )
+        self.assertNotContains(
+            response,
+            reverse("admin:audit_operationlog_changelist"),
         )
 
 
@@ -382,13 +440,33 @@ class SemanticFixture:
 
 class SemanticMetadataTests(SemanticFixture, TestCase):
 
+    def test_new_profile_is_not_released(self):
+        profile = TableProfile.objects.create(
+            schema_name="public",
+            table_name="new_table",
+        )
+
+        self.assertFalse(profile.is_released)
+
     def test_unconfigured_mutable_table_needs_review_and_is_read_only(self):
         effective = self.service().resolve(self.attendance)
 
+        self.assertEqual(effective.configuration_status, NOT_CONFIGURED)
         self.assertEqual(effective.status, NEEDS_REVIEW)
         self.assertFalse(effective.capabilities.can_insert)
         self.assertFalse(effective.capabilities.can_update)
         self.assertFalse(effective.capabilities.can_delete)
+
+    def test_partial_configuration_is_incomplete(self):
+        TableProfile.objects.create(
+            schema_name="public",
+            table_name="attendance",
+            mutation_enabled=True,
+        )
+
+        effective = self.service().resolve(self.attendance)
+
+        self.assertEqual(effective.configuration_status, INCOMPLETE)
 
     def test_nullable_column_can_be_semantically_required_lookup(self):
         self.configure_attendance()
@@ -396,11 +474,23 @@ class SemanticMetadataTests(SemanticFixture, TestCase):
         effective = self.service().resolve(self.attendance)
         employee = effective.columns["employee_code"]
 
+        self.assertEqual(effective.configuration_status, COMPLETE)
         self.assertEqual(effective.status, READY)
         self.assertTrue(employee.required_on_insert)
         self.assertFalse(employee.allow_clear_on_update)
         self.assertIsNotNone(employee.lookup)
+        self.assertFalse(effective.profile.is_released)
+        self.assertFalse(effective.capabilities.can_insert)
+        self.assertFalse(effective.capabilities.can_update)
+        self.assertFalse(effective.capabilities.can_delete)
+
+        effective.profile.is_released = True
+        effective.profile.save(update_fields=["is_released"])
+        effective = self.service().resolve(self.attendance)
+
         self.assertTrue(effective.capabilities.can_insert)
+        self.assertTrue(effective.capabilities.can_update)
+        self.assertTrue(effective.capabilities.can_delete)
 
     def test_optional_lookup_allows_null(self):
         self.configure_attendance(required=False, allow_null=True)
@@ -421,6 +511,21 @@ class SemanticMetadataTests(SemanticFixture, TestCase):
         self.assertEqual(effective.status, NEEDS_REVIEW)
         self.assertFalse(effective.capabilities.can_insert)
 
+    def test_physically_read_only_table_has_read_only_configuration(self):
+        view = TableDefinition(
+            schema="public",
+            name="attendance_view",
+            table_type="VIEW",
+            primary_key=[],
+            columns=self.attendance.columns,
+        )
+
+        effective = EffectiveMetadataService(
+            introspector=StubIntrospector(view)
+        ).resolve(view)
+
+        self.assertEqual(effective.configuration_status, READ_ONLY)
+
     def test_unreviewed_column_keeps_table_in_review(self):
         self.configure_attendance()
         ColumnProfile.objects.filter(column_name="note").update(reviewed=False)
@@ -429,6 +534,515 @@ class SemanticMetadataTests(SemanticFixture, TestCase):
 
         self.assertEqual(effective.status, NEEDS_REVIEW)
         self.assertFalse(effective.capabilities.can_insert)
+
+
+@override_settings(
+    STORAGES={
+        "default": {
+            "BACKEND": "django.core.files.storage.FileSystemStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+)
+class DatabaseConfigurationTests(SemanticFixture, TestCase):
+    def setUp(self):
+        self.superuser = get_user_model().objects.create_superuser(
+            username="root",
+            email="root@example.com",
+            password="password",
+        )
+        self.normal_user = get_user_model().objects.create_user(
+            username="staff",
+            password="password",
+            is_staff=True,
+        )
+        self.partial = TableDefinition(
+            schema="public",
+            name="partial",
+            table_type="BASE TABLE",
+            primary_key=self.attendance.primary_key,
+            columns=self.attendance.columns,
+        )
+        self.read_only_view = TableDefinition(
+            schema="public",
+            name="attendance_view",
+            table_type="VIEW",
+            primary_key=[],
+            columns=self.attendance.columns,
+        )
+        self.introspector = StubIntrospector(
+            self.attendance,
+            self.employee,
+            self.partial,
+            self.read_only_view,
+        )
+        self.url = reverse("dbtool:database_configuration")
+
+    def test_superuser_sees_tables_statuses_release_state_and_actions(self):
+        self.configure_attendance()
+        TableProfile.objects.filter(
+            schema_name="public",
+            table_name="attendance",
+        ).update(is_released=True)
+        TableProfile.objects.create(
+            schema_name="public",
+            table_name="partial",
+            mutation_enabled=True,
+        )
+        self.client.force_login(self.superuser)
+
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        rows = {item["name"]: item for item in response.context["tables"]}
+        self.assertEqual(rows["attendance"]["configuration_status"], COMPLETE)
+        self.assertEqual(rows["attendance"]["release_status"], "RELEASED")
+        self.assertEqual(rows["attendance"]["action"], "Edit configuration")
+        self.assertEqual(rows["employee"]["configuration_status"], NOT_CONFIGURED)
+        self.assertEqual(rows["employee"]["release_status"], "NOT RELEASED")
+        self.assertEqual(rows["employee"]["action"], "Configure")
+        self.assertEqual(rows["partial"]["configuration_status"], INCOMPLETE)
+        self.assertEqual(rows["partial"]["action"], "Continue configuration")
+        self.assertEqual(
+            rows["attendance_view"]["configuration_status"], READ_ONLY
+        )
+        self.assertEqual(rows["attendance_view"]["release_status"], "—")
+        self.assertEqual(rows["attendance_view"]["action"], "View")
+        self.assertEqual(
+            rows["attendance"]["action_url"],
+            reverse(
+                "dbtool:table_review",
+                kwargs={"schema": "public", "table": "attendance"},
+            ),
+        )
+        self.assertEqual(
+            rows["employee"]["action_url"],
+            reverse(
+                "dbtool:table_review",
+                kwargs={"schema": "public", "table": "employee"},
+            ),
+        )
+        self.assertContains(response, reverse("admin:index"))
+        self.assertContains(response, reverse("dbtool:table_list"))
+        self.assertContains(
+            response,
+            reverse("admin:audit_operationlog_changelist"),
+        )
+
+    def test_normal_authenticated_user_is_forbidden(self):
+        self.client.force_login(self.normal_user)
+
+        response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 403)
+
+
+@override_settings(
+    STORAGES={
+        "default": {
+            "BACKEND": "django.core.files.storage.FileSystemStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+)
+class ReleaseWorkflowTests(SemanticFixture, TestCase):
+    def setUp(self):
+        self.superuser = get_user_model().objects.create_superuser(
+            username="root",
+            email="root@example.com",
+            password="password",
+        )
+        self.normal_user = get_user_model().objects.create_user(
+            username="staff",
+            password="password",
+            is_staff=True,
+        )
+        self.introspector = StubIntrospector(
+            self.attendance,
+            self.employee,
+        )
+        self.release_url = reverse(
+            "dbtool:table_release",
+            kwargs={"schema": "public", "table": "attendance"},
+        )
+        self.unrelease_url = reverse(
+            "dbtool:table_unrelease",
+            kwargs={"schema": "public", "table": "attendance"},
+        )
+
+    def test_incomplete_table_cannot_be_released(self):
+        profile = TableProfile.objects.create(
+            schema_name="public",
+            table_name="attendance",
+            mutation_enabled=True,
+        )
+        self.client.force_login(self.superuser)
+
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.post(self.release_url)
+
+        self.assertEqual(response.status_code, 403)
+        profile.refresh_from_db()
+        self.assertFalse(profile.is_released)
+
+    def test_complete_table_can_be_released_but_is_not_auto_released(self):
+        self.configure_attendance()
+        profile = TableProfile.objects.get(
+            schema_name="public",
+            table_name="attendance",
+        )
+        self.assertEqual(
+            self.service().resolve(self.attendance).configuration_status,
+            COMPLETE,
+        )
+        self.assertFalse(profile.is_released)
+        self.client.force_login(self.superuser)
+
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.post(self.release_url)
+
+        self.assertRedirects(
+            response,
+            reverse("dbtool:database_configuration"),
+            fetch_redirect_response=False,
+        )
+        profile.refresh_from_db()
+        self.assertTrue(profile.is_released)
+
+    def test_user_table_list_only_contains_released_tables(self):
+        self.configure_attendance()
+        profile = TableProfile.objects.get(
+            schema_name="public",
+            table_name="attendance",
+        )
+        self.client.force_login(self.normal_user)
+
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(reverse("dbtool:table_list"))
+
+        self.assertNotContains(response, "public.attendance")
+        self.assertEqual(response.context["tables"], [])
+
+        profile.is_released = True
+        profile.save(update_fields=["is_released"])
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(reverse("dbtool:table_list"))
+
+        self.assertEqual(
+            [item["name"] for item in response.context["tables"]],
+            ["attendance"],
+        )
+        self.assertEqual(
+            response.context["tables"][0]["action_url"],
+            reverse(
+                "dbtool:table_detail",
+                kwargs={"schema": "public", "table": "attendance"},
+            ),
+        )
+        self.assertContains(response, "Attendance")
+
+    def test_normal_user_cannot_open_unreleased_table_directly(self):
+        self.configure_attendance()
+        self.client.force_login(self.normal_user)
+
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(
+                reverse(
+                    "dbtool:table_detail",
+                    kwargs={"schema": "public", "table": "attendance"},
+                )
+            )
+
+        self.assertEqual(response.status_code, 403)
+
+    def test_review_page_shows_release_state_and_matching_action(self):
+        self.configure_attendance()
+        profile = TableProfile.objects.get(
+            schema_name="public",
+            table_name="attendance",
+        )
+        review_url = reverse(
+            "dbtool:table_review",
+            kwargs={"schema": "public", "table": "attendance"},
+        )
+        self.client.force_login(self.superuser)
+
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(review_url)
+
+        self.assertContains(response, "Configuration status:</strong> COMPLETE")
+        self.assertContains(response, "Release status:</strong> NOT RELEASED")
+        self.assertContains(response, self.release_url)
+        self.assertNotContains(response, self.unrelease_url)
+
+        profile.is_released = True
+        profile.save(update_fields=["is_released"])
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(review_url)
+
+        self.assertContains(response, "Release status:</strong> RELEASED")
+        self.assertContains(response, self.unrelease_url)
+        self.assertNotContains(response, self.release_url)
+
+    def test_unrelease_hides_table_without_deleting_configuration(self):
+        self.configure_attendance()
+        profile = TableProfile.objects.get(
+            schema_name="public",
+            table_name="attendance",
+        )
+        profile.is_released = True
+        profile.save(update_fields=["is_released"])
+        column_count = profile.column_profiles.count()
+        lookup_count = LookupMapping.objects.filter(
+            column_profile__table_profile=profile
+        ).count()
+        self.client.force_login(self.superuser)
+
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.post(self.unrelease_url)
+
+        self.assertRedirects(
+            response,
+            reverse("dbtool:database_configuration"),
+            fetch_redirect_response=False,
+        )
+        profile.refresh_from_db()
+        self.assertFalse(profile.is_released)
+        self.assertEqual(profile.column_profiles.count(), column_count)
+        self.assertEqual(
+            LookupMapping.objects.filter(
+                column_profile__table_profile=profile
+            ).count(),
+            lookup_count,
+        )
+
+        self.client.force_login(self.normal_user)
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(reverse("dbtool:table_list"))
+        self.assertEqual(response.context["tables"], [])
+
+
+@override_settings(
+    STORAGES={
+        "default": {
+            "BACKEND": "django.core.files.storage.FileSystemStorage",
+        },
+        "staticfiles": {
+            "BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage",
+        },
+    }
+)
+class AutoUnreleaseTests(SemanticFixture, TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_superuser(
+            username="root",
+            email="root@example.com",
+            password="password",
+        )
+        self.client.force_login(self.user)
+        self.introspector = StubIntrospector(self.attendance, self.employee)
+        self.configure_attendance()
+        self.profile = TableProfile.objects.get(
+            schema_name="public",
+            table_name="attendance",
+        )
+        self.profile.is_released = True
+        self.profile.save(update_fields=["is_released"])
+        self.url = reverse(
+            "dbtool:table_review",
+            kwargs={"schema": "public", "table": "attendance"},
+        )
+
+    def review_data(self):
+        return {
+            "table-display_label": "Attendance",
+            "table-mutation_enabled": "on",
+            "column-0-reviewed": "on",
+            "column-0-display_label": "",
+            "column-0-allow_clear_on_update": "on",
+            "column-0-input_mode": "text",
+            "column-0-help_text": "",
+            "column-1-reviewed": "on",
+            "column-1-display_label": "Employee",
+            "column-1-show_in_form": "on",
+            "column-1-editable": "on",
+            "column-1-required_on_insert": "on",
+            "column-1-input_mode": "lookup",
+            "column-1-help_text": "",
+            "column-1-target_schema": "public",
+            "column-1-target_table": "employee",
+            "column-1-target_value_column": "code",
+            "column-1-display_columns": ["code", "name"],
+            "column-1-search_columns": ["code", "name"],
+            "column-2-reviewed": "on",
+            "column-2-display_label": "Note",
+            "column-2-show_in_form": "on",
+            "column-2-editable": "on",
+            "column-2-allow_clear_on_update": "on",
+            "column-2-input_mode": "text",
+            "column-2-help_text": "",
+        }
+
+    def post_review(self, data):
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            return self.client.post(self.url, data)
+
+    def assert_released(self):
+        self.profile.refresh_from_db()
+        self.assertTrue(self.profile.is_released)
+
+    def assert_unreleased(self):
+        self.profile.refresh_from_db()
+        self.assertFalse(self.profile.is_released)
+
+    def test_opening_configuration_does_not_unrelease(self):
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(self.url)
+
+        self.assertEqual(response.status_code, 200)
+        self.assert_released()
+
+    def test_editing_without_save_does_not_unrelease(self):
+        with patch(
+            "dbtool.views.SchemaIntrospector",
+            return_value=self.introspector,
+        ):
+            response = self.client.get(self.url)
+
+        response.context["table_form"].initial["display_label"] = "Unsaved"
+        self.assert_released()
+
+    def test_no_op_save_does_not_unrelease(self):
+        response = self.post_review(self.review_data())
+
+        self.assertRedirects(response, self.url, fetch_redirect_response=False)
+        self.assert_released()
+
+    def test_successful_table_profile_change_unreleases(self):
+        data = self.review_data()
+        data["table-display_label"] = "Attendance Events"
+
+        response = self.post_review(data)
+
+        self.assertRedirects(response, self.url, fetch_redirect_response=False)
+        self.assert_unreleased()
+        self.profile.refresh_from_db()
+        self.assertEqual(self.profile.display_label, "Attendance Events")
+
+    def test_failed_save_does_not_unrelease_or_persist_changes(self):
+        data = self.review_data()
+        data["table-display_label"] = "Must Not Persist"
+        data.pop("column-1-target_value_column")
+
+        response = self.post_review(data)
+
+        self.assertEqual(response.status_code, 200)
+        self.assertTrue(response.context["column_forms"][1][1].errors)
+        self.assert_released()
+        self.profile.refresh_from_db()
+        self.assertEqual(self.profile.display_label, "Attendance")
+
+    def test_persistence_failure_rolls_back_change_and_unrelease(self):
+        data = self.review_data()
+        data["table-display_label"] = "Must Roll Back"
+
+        with patch(
+            "dbtool.views.LookupMapping.objects.update_or_create",
+            side_effect=RuntimeError("save failed"),
+        ):
+            with self.assertRaisesMessage(RuntimeError, "save failed"):
+                self.post_review(data)
+
+        self.assert_released()
+        self.profile.refresh_from_db()
+        self.assertEqual(self.profile.display_label, "Attendance")
+
+    def test_lookup_mapping_admin_change_unreleases(self):
+        lookup = LookupMapping.objects.get(
+            column_profile__table_profile=self.profile,
+            column_profile__column_name="employee_code",
+        )
+        response = self.client.post(
+            reverse("admin:dbtool_lookupmapping_change", args=[lookup.pk]),
+            {
+                "column_profile": lookup.column_profile_id,
+                "target_schema": "public",
+                "target_table": "employee",
+                "target_value_column": "name",
+                "display_columns": '["code", "name"]',
+                "search_columns": '["code", "name"]',
+                "_save": "Save",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assert_unreleased()
+        lookup.refresh_from_db()
+        self.assertEqual(lookup.target_value_column, "name")
+
+    def test_column_profile_admin_change_unreleases(self):
+        column = self.profile.column_profiles.get(column_name="employee_code")
+        response = self.client.post(
+            reverse("admin:dbtool_columnprofile_change", args=[column.pk]),
+            {
+                "table_profile": self.profile.pk,
+                "column_name": "employee_code",
+                "display_label": "Employee",
+                "show_in_form": "on",
+                "editable": "on",
+                "allow_clear_on_update": "",
+                "input_mode": ColumnProfile.InputMode.LOOKUP,
+                "help_text": "",
+                "reviewed": "on",
+                "_save": "Save",
+            },
+        )
+
+        self.assertEqual(response.status_code, 302)
+        self.assert_unreleased()
+        column.refresh_from_db()
+        self.assertFalse(column.required_on_insert)
 
 
 @override_settings(
@@ -456,14 +1070,16 @@ class ReviewFlowTests(SemanticFixture, TestCase):
             "dbtool.views.SchemaIntrospector",
             return_value=self.introspector,
         ):
-            response = self.client.get(reverse("dbtool:table_list"))
+            response = self.client.get(
+                reverse("dbtool:database_configuration")
+            )
             review_url = reverse(
                 "dbtool:table_review",
                 kwargs={"schema": "public", "table": "attendance"},
             )
 
         self.assertContains(response, review_url)
-        self.assertContains(response, "Review")
+        self.assertContains(response, "Configure")
 
         admin_response = self.client.get(reverse("admin:index"))
         self.assertContains(admin_response, reverse("dbtool:table_list"))

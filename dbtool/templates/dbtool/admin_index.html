@@ -1,6 +1,12 @@
 {% extends "admin/index.html" %}
 
 {% block content %}
-<p><a class="button" href="{% url 'dbtool:table_list' %}">Database Editor</a></p>
+<p>
+  <a class="button" href="{% url 'dbtool:table_list' %}">Database Editor</a>
+  {% if user.is_superuser %}
+    <a class="button" href="{% url 'dbtool:database_configuration' %}">Database Configuration</a>
+    <a class="button" href="{% url 'admin:audit_operationlog_changelist' %}">Operation Logs</a>
+  {% endif %}
+</p>
 {{ block.super }}
 {% endblock %}

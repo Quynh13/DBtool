@@ -28,9 +28,18 @@ from dbtool.row_state import (
     make_state_token,
 )
 from dbtool.safety import SafetyPolicy
-from dbtool.semantics import EffectiveMetadataService, NEEDS_REVIEW, READY
+from dbtool.semantics import (
+    COMPLETE,
+    INCOMPLETE,
+    NEEDS_REVIEW,
+    NOT_CONFIGURED,
+    READY,
+    READ_ONLY,
+    EffectiveMetadataService,
+)
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
+from django.views.decorators.http import require_POST
 
 from audit.models import OperationLog
 from dbtool.rollback import (
@@ -175,6 +184,9 @@ def table_list(request):
 
         effective = metadata.resolve(definition)
 
+        if not effective.profile or not effective.profile.is_released:
+            continue
+
         tables.append(
             {
                 "schema": schema,
@@ -183,8 +195,12 @@ def table_list(request):
                 "primary_key": definition.primary_key,
                 "label": effective.display_label,
                 "safety": effective.status,
-                "action": "Review" if effective.status == NEEDS_REVIEW else (
+                "action": (
                     "Open" if effective.status == READY else "View"
+                ),
+                "action_url": reverse(
+                    "dbtool:table_detail",
+                    kwargs={"schema": schema, "table": table_name},
                 ),
             }
         )
@@ -195,6 +211,67 @@ def table_list(request):
         {
             "tables": tables,
         },
+    )
+
+
+def database_configuration(request):
+    if not request.user.is_superuser:
+        raise PermissionDenied(
+            "Only a superuser can access database configuration."
+        )
+
+    introspector = SchemaIntrospector()
+    metadata = EffectiveMetadataService(introspector=introspector)
+    actions = {
+        NOT_CONFIGURED: "Configure",
+        INCOMPLETE: "Continue configuration",
+        COMPLETE: "Edit configuration",
+        READ_ONLY: "View",
+    }
+    tables = []
+
+    for schema, table_name, _table_type in introspector.list_tables():
+        definition = introspector.inspect_table(schema, table_name)
+        effective = metadata.resolve(definition)
+        released = bool(effective.profile and effective.profile.is_released)
+        tables.append(
+            {
+                "schema": schema,
+                "name": table_name,
+                "configuration_status": effective.configuration_status,
+                "release_status": (
+                    "RELEASED"
+                    if released
+                    else (
+                        "—"
+                        if effective.configuration_status == READ_ONLY
+                        else "NOT RELEASED"
+                    )
+                ),
+                "action": actions[effective.configuration_status],
+                "action_url": reverse(
+                    "dbtool:table_review",
+                    kwargs={"schema": schema, "table": table_name},
+                ),
+                "can_release": (
+                    effective.configuration_status == COMPLETE and not released
+                ),
+                "can_unrelease": released,
+                "release_url": reverse(
+                    "dbtool:table_release",
+                    kwargs={"schema": schema, "table": table_name},
+                ),
+                "unrelease_url": reverse(
+                    "dbtool:table_unrelease",
+                    kwargs={"schema": schema, "table": table_name},
+                ),
+            }
+        )
+
+    return render(
+        request,
+        "dbtool/database_configuration.html",
+        {"tables": tables},
     )
 
 
@@ -213,6 +290,11 @@ def table_detail(request, schema, table):
     effective = EffectiveMetadataService(introspector=introspector).resolve(
         definition
     )
+    if (
+        not request.user.is_superuser
+        and (not effective.profile or not effective.profile.is_released)
+    ):
+        raise PermissionDenied("This table has not been released.")
     capabilities = effective.capabilities
 
     column_rows = []
@@ -335,6 +417,11 @@ def table_detail(request, schema, table):
 
 
 def table_review(request, schema, table):
+    if not request.user.is_superuser:
+        raise PermissionDenied(
+            "Only a superuser can review table configuration."
+        )
+
     introspector = SchemaIntrospector()
     try:
         definition = introspector.inspect_table(schema, table)
@@ -459,11 +546,78 @@ def table_review(request, schema, table):
         {
             "definition": definition,
             "status": effective.status,
+            "configuration_status": effective.configuration_status,
+            "release_status": (
+                "RELEASED"
+                if effective.profile and effective.profile.is_released
+                else "NOT RELEASED"
+            ),
+            "can_release": (
+                effective.configuration_status == COMPLETE
+                and effective.profile is not None
+                and not effective.profile.is_released
+            ),
+            "can_unrelease": bool(
+                effective.profile and effective.profile.is_released
+            ),
             "table_form": table_form,
             "column_forms": column_forms,
             "catalog": catalog,
         },
     )
+
+
+@require_POST
+def table_release(request, schema, table):
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only a superuser can release tables.")
+
+    introspector = SchemaIntrospector()
+    try:
+        definition = introspector.inspect_table(schema, table)
+    except ValueError as exc:
+        raise Http404(str(exc)) from exc
+
+    effective = EffectiveMetadataService(introspector=introspector).resolve(
+        definition
+    )
+    if (
+        effective.configuration_status != COMPLETE
+        or effective.profile is None
+        or effective.profile.is_released
+    ):
+        raise PermissionDenied(
+            "Only complete, unreleased table configuration can be released."
+        )
+
+    effective.profile.is_released = True
+    effective.profile.save(update_fields=["is_released"])
+    messages.success(request, f"{schema}.{table} released.")
+    return redirect("dbtool:database_configuration")
+
+
+@require_POST
+def table_unrelease(request, schema, table):
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only a superuser can unrelease tables.")
+
+    try:
+        SchemaIntrospector().inspect_table(schema, table)
+    except ValueError as exc:
+        raise Http404(str(exc)) from exc
+
+    profile = get_object_or_404(
+        TableProfile,
+        schema_name=schema,
+        table_name=table,
+    )
+    if not profile.is_released:
+        raise PermissionDenied("Table is not released.")
+
+    profile.is_released = False
+    profile.save(update_fields=["is_released"])
+    messages.success(request, f"{schema}.{table} unreleased.")
+    return redirect("dbtool:database_configuration")
 
 
 def row_add(request, schema, table):
@@ -828,7 +982,13 @@ def lookup_search(request, schema, table, column):
         definition
     )
     effective_column = effective.columns.get(column)
-    if effective.status != READY or not effective_column or not effective_column.lookup:
+    if (
+        effective.status != READY
+        or not effective.profile
+        or not effective.profile.is_released
+        or not effective_column
+        or not effective_column.lookup
+    ):
         raise Http404("Lookup is not configured.")
 
     lookup = effective_column.lookup

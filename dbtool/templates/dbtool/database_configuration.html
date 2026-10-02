@@ -1,0 +1,53 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Database Configuration{% endblock %}
+
+{% block content %}
+<p>
+  <a href="{% url 'admin:index' %}">Back</a>
+  &nbsp;|&nbsp;
+  <a href="{% url 'dbtool:table_list' %}">Database Editor</a>
+  &nbsp;|&nbsp;
+  <a href="{% url 'admin:audit_operationlog_changelist' %}">Operation Logs</a>
+</p>
+
+<h1>Database Configuration</h1>
+
+<div class="module">
+  <table style="width: 100%;">
+    <thead>
+      <tr>
+        <th>Table</th>
+        <th>Config status</th>
+        <th>Release status</th>
+        <th>Action</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for table in tables %}
+      <tr>
+        <td>{{ table.schema }}.{{ table.name }}</td>
+        <td>{{ table.configuration_status }}</td>
+        <td>{{ table.release_status }}</td>
+        <td>
+          <a href="{{ table.action_url }}">{{ table.action }}</a>
+          {% if table.can_release %}
+          <form method="post" action="{{ table.release_url }}" style="display: inline;">
+            {% csrf_token %}
+            <button type="submit">Release</button>
+          </form>
+          {% elif table.can_unrelease %}
+          <form method="post" action="{{ table.unrelease_url }}" style="display: inline;">
+            {% csrf_token %}
+            <button type="submit">Unrelease</button>
+          </form>
+          {% endif %}
+        </td>
+      </tr>
+      {% empty %}
+      <tr><td colspan="4">No tables found.</td></tr>
+      {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% endblock %}
