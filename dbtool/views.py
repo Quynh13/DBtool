@@ -3,11 +3,18 @@ import math
 from django.contrib import messages
 from django.core import signing
 from django.core.exceptions import PermissionDenied
-from django.http import Http404
+from django.db import transaction
+from django.http import Http404, JsonResponse
 from django.shortcuts import redirect, render
 
-from dbtool.forms import build_row_form
+from dbtool.forms import (
+    ColumnReviewForm,
+    TableReviewForm,
+    build_row_form,
+    populate_lookup_choices,
+)
 from dbtool.introspection import SchemaIntrospector
+from dbtool.models import ColumnProfile, LookupMapping, TableProfile
 from dbtool.mutations import (
     MutationService,
     RowNotFound,
@@ -21,6 +28,7 @@ from dbtool.row_state import (
     make_state_token,
 )
 from dbtool.safety import SafetyPolicy
+from dbtool.semantics import EffectiveMetadataService, NEEDS_REVIEW, READY
 from django.shortcuts import get_object_or_404
 from django.urls import reverse
 
@@ -47,16 +55,6 @@ def _display_value(value):
     return str(value)
 
 
-def _safety_label(definition, capabilities):
-    if definition.table_type != "BASE TABLE":
-        return "READ ONLY"
-
-    if capabilities.can_insert and capabilities.can_update and capabilities.can_delete:
-        return "SAFE"
-
-    return "RESTRICTED"
-
-
 def _load_record_key(row_token):
     try:
         return load_row_token(row_token)
@@ -64,9 +62,108 @@ def _load_record_key(row_token):
         raise Http404("Invalid row identifier.") from exc
 
 
+def _lookup_urls(effective):
+    return {
+        name: reverse(
+            "dbtool:lookup_search",
+            kwargs={
+                "schema": effective.definition.schema,
+                "table": effective.definition.name,
+                "column": name,
+            },
+        )
+        for name, column in effective.columns.items()
+        if column.lookup is not None
+    }
+
+
+def _form_sections(form, effective, mode):
+    required = []
+    optional = []
+    for name in form.fields:
+        column = effective.columns[name]
+        is_required = (
+            column.required_on_insert
+            if mode == "insert"
+            else not column.allow_clear_on_update
+        )
+        item = {"field": form[name], "required": is_required}
+        (required if is_required else optional).append(item)
+
+    system = [
+        {
+            "label": column.label,
+            "help_text": column.help_text,
+            "reason": (
+                "Database managed"
+                if column.physical.identity or column.physical.generated
+                else "Read only"
+            ),
+        }
+        for name, column in effective.columns.items()
+        if name not in form.fields
+    ]
+    return (
+        ("Required", required),
+        ("Optional", optional),
+        ("System managed", system),
+    )
+
+
+def _metadata_catalog(introspector):
+    catalog = {}
+    for schema, table, _table_type in introspector.list_tables():
+        definition = introspector.inspect_table(schema, table)
+        catalog.setdefault(schema, {})[table] = [
+            column.name for column in definition.columns
+        ]
+    return catalog
+
+
+def _column_review_initial(column, profile, capability):
+    if profile is None:
+        editable = capability.can_insert or capability.can_update
+        return {
+            "reviewed": False,
+            "display_label": column.name,
+            "show_in_form": editable,
+            "editable": editable,
+            "required_on_insert": capability.required_on_insert,
+            "allow_clear_on_update": column.nullable,
+            "input_mode": ColumnProfile.InputMode.TEXT,
+        }
+
+    initial = {
+        "reviewed": profile.reviewed,
+        "display_label": profile.display_label,
+        "show_in_form": profile.show_in_form,
+        "editable": profile.editable,
+        "required_on_insert": profile.required_on_insert,
+        "allow_clear_on_update": profile.allow_clear_on_update,
+        "input_mode": profile.input_mode,
+        "help_text": profile.help_text,
+    }
+    try:
+        lookup = profile.lookup_mapping
+    except LookupMapping.DoesNotExist:
+        return initial
+    initial.update(
+        {
+            "target_schema": lookup.target_schema,
+            "target_table": lookup.target_table,
+            "target_value_column": lookup.target_value_column,
+            "display_columns": lookup.display_columns,
+            "search_columns": lookup.search_columns,
+            "allow_null": lookup.allow_null,
+            "allow_arbitrary_value": lookup.allow_arbitrary_value,
+        }
+    )
+    return initial
+
+
 def table_list(request):
     introspector = SchemaIntrospector()
-    policy = SafetyPolicy()
+    metadata = EffectiveMetadataService(introspector=introspector)
 
     tables = []
 
@@ -76,7 +173,7 @@ def table_list(request):
             table_name,
         )
 
-        capabilities = policy.evaluate(definition)
+        effective = metadata.resolve(definition)
 
         tables.append(
             {
@@ -84,9 +181,10 @@ def table_list(request):
                 "name": table_name,
                 "type": table_type,
                 "primary_key": definition.primary_key,
-                "safety": _safety_label(
-                    definition,
-                    capabilities,
+                "label": effective.display_label,
+                "safety": effective.status,
+                "action": "Review" if effective.status == NEEDS_REVIEW else (
+                    "Open" if effective.status == READY else "View"
                 ),
             }
         )
@@ -102,7 +200,6 @@ def table_list(request):
 
 def table_detail(request, schema, table):
     introspector = SchemaIntrospector()
-    policy = SafetyPolicy()
     repository = GenericTableRepository()
 
     try:
@@ -113,7 +210,10 @@ def table_detail(request, schema, table):
     except ValueError as exc:
         raise Http404(str(exc)) from exc
 
-    capabilities = policy.evaluate(definition)
+    effective = EffectiveMetadataService(introspector=introspector).resolve(
+        definition
+    )
+    capabilities = effective.capabilities
 
     column_rows = []
 
@@ -128,6 +228,16 @@ def table_detail(request, schema, table):
                 "insert_display": ("✓" if capability.can_insert else "—"),
                 "update_display": ("✓" if capability.can_update else "—"),
                 "warning_display": ", ".join(capability.warnings),
+                "label": effective.columns[column.name].label,
+                "group": (
+                    "System managed"
+                    if effective.columns[column.name].system_managed
+                    else (
+                        "Required"
+                        if effective.columns[column.name].required_on_insert
+                        else "Optional"
+                    )
+                ),
             }
         )
 
@@ -194,12 +304,19 @@ def table_detail(request, schema, table):
         "dbtool/table_detail.html",
         {
             "definition": definition,
+            "display_label": effective.display_label,
             "capabilities": capabilities,
             "column_rows": column_rows,
-            "safety": _safety_label(
-                definition,
-                capabilities,
+            "safety": effective.status,
+            "configuration_action": (
+                "Review configuration"
+                if effective.status == NEEDS_REVIEW
+                else "Edit configuration"
             ),
+            "show_configuration_action": effective.status in {
+                NEEDS_REVIEW,
+                READY,
+            },
             "rows": rows,
             "total_rows": total_rows,
             "page": page,
@@ -217,9 +334,140 @@ def table_detail(request, schema, table):
     )
 
 
+def table_review(request, schema, table):
+    introspector = SchemaIntrospector()
+    try:
+        definition = introspector.inspect_table(schema, table)
+    except ValueError as exc:
+        raise Http404(str(exc)) from exc
+
+    profile = (
+        TableProfile.objects.filter(schema_name=schema, table_name=table)
+        .prefetch_related("column_profiles__lookup_mapping")
+        .first()
+    )
+    existing_profiles = (
+        {item.column_name: item for item in profile.column_profiles.all()}
+        if profile
+        else {}
+    )
+    catalog = _metadata_catalog(introspector)
+    physical = SafetyPolicy().evaluate(definition)
+    table_initial = {
+        "display_label": profile.display_label if profile else definition.name,
+        "mutation_enabled": profile.mutation_enabled if profile else True,
+    }
+    table_form = TableReviewForm(
+        request.POST or None,
+        prefix="table",
+        initial=table_initial,
+    )
+    column_forms = []
+    for index, column in enumerate(definition.columns):
+        column_profile = existing_profiles.get(column.name)
+        column_forms.append(
+            (
+                column,
+                ColumnReviewForm(
+                    request.POST or None,
+                    prefix=f"column-{index}",
+                    catalog=catalog,
+                    initial=_column_review_initial(
+                        column,
+                        column_profile,
+                        physical.columns[column.name],
+                    ),
+                ),
+            )
+        )
+
+    if request.method == "POST":
+        table_valid = table_form.is_valid()
+        columns_valid = all([form.is_valid() for _column, form in column_forms])
+        if table_valid and columns_valid:
+            with transaction.atomic():
+                profile, _created = TableProfile.objects.update_or_create(
+                    schema_name=schema,
+                    table_name=table,
+                    defaults=table_form.cleaned_data,
+                )
+                physical_names = {column.name for column in definition.columns}
+                profile.column_profiles.exclude(
+                    column_name__in=physical_names
+                ).delete()
+
+                for column, form in column_forms:
+                    data = form.cleaned_data
+                    column_profile, _created = (
+                        ColumnProfile.objects.update_or_create(
+                            table_profile=profile,
+                            column_name=column.name,
+                            defaults={
+                                "reviewed": data["reviewed"],
+                                "display_label": data["display_label"],
+                                "show_in_form": data["show_in_form"],
+                                "editable": data["editable"],
+                                "required_on_insert": data[
+                                    "required_on_insert"
+                                ],
+                                "allow_clear_on_update": data[
+                                    "allow_clear_on_update"
+                                ],
+                                "input_mode": data["input_mode"],
+                                "help_text": data["help_text"],
+                            },
+                        )
+                    )
+                    if data["input_mode"] == ColumnProfile.InputMode.LOOKUP:
+                        LookupMapping.objects.update_or_create(
+                            column_profile=column_profile,
+                            defaults={
+                                "target_schema": data["target_schema"],
+                                "target_table": data["target_table"],
+                                "target_value_column": data[
+                                    "target_value_column"
+                                ],
+                                "display_columns": data["display_columns"],
+                                "search_columns": data["search_columns"],
+                                "allow_null": data["allow_null"],
+                                "allow_arbitrary_value": data[
+                                    "allow_arbitrary_value"
+                                ],
+                            },
+                        )
+                    else:
+                        LookupMapping.objects.filter(
+                            column_profile=column_profile
+                        ).delete()
+
+            status = EffectiveMetadataService(
+                introspector=introspector
+            ).resolve(definition).status
+            messages.success(request, f"Configuration saved. Status: {status}.")
+            return redirect(
+                "dbtool:table_review",
+                schema=schema,
+                table=table,
+            )
+
+    effective = EffectiveMetadataService(introspector=introspector).resolve(
+        definition
+    )
+    return render(
+        request,
+        "dbtool/table_review.html",
+        {
+            "definition": definition,
+            "status": effective.status,
+            "table_form": table_form,
+            "column_forms": column_forms,
+            "catalog": catalog,
+        },
+    )
+
+
 def row_add(request, schema, table):
     introspector = SchemaIntrospector()
-    policy = SafetyPolicy()
 
     try:
         definition = introspector.inspect_table(
@@ -229,15 +477,18 @@ def row_add(request, schema, table):
     except ValueError as exc:
         raise Http404(str(exc)) from exc
 
-    capabilities = policy.evaluate(definition)
+    effective = EffectiveMetadataService(introspector=introspector).resolve(
+        definition
+    )
+    capabilities = effective.capabilities
 
     if not capabilities.can_insert:
         raise PermissionDenied("INSERT is not allowed for this table.")
 
     FormClass = build_row_form(
-        definition,
-        capabilities,
+        effective,
         mode="insert",
+        lookup_urls=_lookup_urls(effective),
     )
 
     if request.method == "POST":
@@ -293,6 +544,8 @@ def row_add(request, schema, table):
     else:
         form = FormClass()
 
+    populate_lookup_choices(form, effective)
+
     return render(
         request,
         "dbtool/row_form.html",
@@ -300,6 +553,8 @@ def row_add(request, schema, table):
             "definition": definition,
             "form": form,
             "mode": "Add",
+            "display_label": effective.display_label,
+            "form_sections": _form_sections(form, effective, "insert"),
             "state_token": "",
         },
     )
@@ -312,7 +567,6 @@ def row_edit(
     row_token,
 ):
     introspector = SchemaIntrospector()
-    policy = SafetyPolicy()
     repository = GenericTableRepository()
 
     try:
@@ -323,7 +577,10 @@ def row_edit(
     except ValueError as exc:
         raise Http404(str(exc)) from exc
 
-    capabilities = policy.evaluate(definition)
+    effective = EffectiveMetadataService(introspector=introspector).resolve(
+        definition
+    )
+    capabilities = effective.capabilities
 
     if not capabilities.can_update:
         raise PermissionDenied("UPDATE is not allowed for this table.")
@@ -340,9 +597,9 @@ def row_edit(
         raise Http404("Row does not exist.")
 
     FormClass = build_row_form(
-        definition,
-        capabilities,
+        effective,
         mode="update",
+        lookup_urls=_lookup_urls(effective),
     )
 
     if request.method == "POST":
@@ -433,6 +690,8 @@ def row_edit(
             current,
         )
 
+    populate_lookup_choices(form, effective, current)
+
     return render(
         request,
         "dbtool/row_form.html",
@@ -440,6 +699,8 @@ def row_edit(
             "definition": definition,
             "form": form,
             "mode": "Edit",
+            "display_label": effective.display_label,
+            "form_sections": _form_sections(form, effective, "update"),
             "state_token": state_token,
         },
     )
@@ -452,7 +713,6 @@ def row_delete(
     row_token,
 ):
     introspector = SchemaIntrospector()
-    policy = SafetyPolicy()
     repository = GenericTableRepository()
 
     try:
@@ -463,7 +723,10 @@ def row_delete(
     except ValueError as exc:
         raise Http404(str(exc)) from exc
 
-    capabilities = policy.evaluate(definition)
+    effective = EffectiveMetadataService(introspector=introspector).resolve(
+        definition
+    )
+    capabilities = effective.capabilities
 
     if not capabilities.can_delete:
         raise PermissionDenied("DELETE is not allowed for this table.")
@@ -552,6 +815,32 @@ def row_delete(
             "state_token": state_token,
         },
     )
+
+
+def lookup_search(request, schema, table, column):
+    introspector = SchemaIntrospector()
+    try:
+        definition = introspector.inspect_table(schema, table)
+    except ValueError as exc:
+        raise Http404(str(exc)) from exc
+
+    effective = EffectiveMetadataService(introspector=introspector).resolve(
+        definition
+    )
+    effective_column = effective.columns.get(column)
+    if effective.status != READY or not effective_column or not effective_column.lookup:
+        raise Http404("Lookup is not configured.")
+
+    lookup = effective_column.lookup
+    results = GenericTableRepository().search_lookup_rows(
+        lookup.target_schema,
+        lookup.target_table,
+        value_column=lookup.target_value_column,
+        display_columns=lookup.display_columns,
+        search_columns=lookup.search_columns,
+        query=request.GET.get("q", "").strip()[:100],
+    )
+    return JsonResponse({"results": results})
 
 
 def operation_rollback(

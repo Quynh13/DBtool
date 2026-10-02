@@ -4,7 +4,7 @@ from django.urls import include, path
 
 urlpatterns = [
     path(
-        "admin/dbtool/",
+        "admin/db-editor/",
         include("dbtool.urls"),
     ),
     path(

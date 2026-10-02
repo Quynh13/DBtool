@@ -1,0 +1,6 @@
+{% extends "admin/index.html" %}
+
+{% block content %}
+<p><a class="button" href="{% url 'dbtool:table_list' %}">Database Editor</a></p>
+{{ block.super }}
+{% endblock %}

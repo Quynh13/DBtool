@@ -46,7 +46,24 @@
   <a href="{% url 'dbtool:table_list' %}">← Back to tables</a>
 </p>
 
-<h1>{{ definition.schema }}.{{ definition.name }}</h1>
+<h1>{{ display_label }}</h1>
+<p>{{ definition.schema }}.{{ definition.name }}</p>
+
+<p><strong>Status:</strong> {{ safety }}</p>
+
+{% if show_configuration_action %}
+<p>
+  <a class="button" href="{% url 'dbtool:table_review' definition.schema definition.name %}">
+    {{ configuration_action }}
+  </a>
+</p>
+{% endif %}
+
+{% if safety == "NEEDS REVIEW" %}
+<div class="dbtool-warning">
+  Semantic metadata is incomplete. Reading remains available; all mutations are disabled.
+</div>
+{% endif %}
 
 {% if capabilities.can_insert %}
 <p>
@@ -56,15 +73,11 @@
 </p>
 {% endif %}
 
-<div class="dbtool-meta">
+<details class="dbtool-meta">
+  <summary><strong>Technical details</strong></summary>
   <p>
     <strong>Type:</strong>
     {{ definition.table_type }}
-  </p>
-
-  <p>
-    <strong>Safety:</strong>
-    {{ safety }}
   </p>
 
   <p>
@@ -76,7 +89,7 @@
     <strong>Total rows:</strong>
     {{ total_rows }}
   </p>
-</div>
+</details>
 
 <h2>Warnings</h2>
 
@@ -97,6 +110,7 @@
     <thead>
       <tr>
         <th>Column</th>
+        <th>Business use</th>
         <th>Type</th>
         <th>Nullable</th>
         <th>PK</th>
@@ -109,7 +123,8 @@
     <tbody>
     {% for item in column_rows %}
       <tr>
-        <td>{{ item.column.name }}</td>
+        <td>{{ item.label }}<br><small>{{ item.column.name }}</small></td>
+        <td>{{ item.group }}</td>
         <td>{{ item.column.data_type }}</td>
         <td>{{ item.nullable_display }}</td>
         <td>{{ item.pk_display }}</td>
@@ -129,7 +144,11 @@
     <thead>
       <tr>
         {% for column in definition.columns %}
-        <th>{{ column.name }}</th>
+        <th>
+          {% for item in column_rows %}
+            {% if item.column.name == column.name %}{{ item.label }}{% endif %}
+          {% endfor %}
+        </th>
         {% endfor %}
         <th>Actions</th>
       </tr>

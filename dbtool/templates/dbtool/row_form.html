@@ -13,8 +13,7 @@
 </p>
 
 <h1>
-  {{ mode }} row:
-  {{ definition.schema }}.{{ definition.name }}
+  {{ mode }} {{ display_label }}
 </h1>
 
 <form method="post">
@@ -22,28 +21,39 @@
   <input type="hidden" name="state_token" value="{{ state_token }}">
   {{ form.non_field_errors }}
 
-  <fieldset class="module aligned">
-
-    {% for field in form %}
-
-    <div class="form-row">
-      {{ field.errors }}
-
-      <div>
-        {{ field.label_tag }}
-        {{ field }}
-
-        {% if field.help_text %}
-        <div class="help">
-          {{ field.help_text }}
+  {% for title, items in form_sections %}
+    {% if items %}
+    <fieldset class="module aligned">
+      <h2>{{ title }}</h2>
+      {% if title == "System managed" %}
+        {% for item in items %}
+        <div class="form-row">
+          <div>
+            <strong>{{ item.label }}</strong>
+            <p>{{ item.reason }}</p>
+            {% if item.help_text %}<div class="help">{{ item.help_text }}</div>{% endif %}
+          </div>
         </div>
-        {% endif %}
-      </div>
-    </div>
-
-    {% endfor %}
-
-  </fieldset>
+        {% endfor %}
+      {% else %}
+        {% for item in items %}
+        <div class="form-row">
+          {{ item.field.errors }}
+          <div>
+            <label for="{{ item.field.id_for_label }}">
+              {{ item.field.label }}{% if item.required %} *{% endif %}
+            </label>
+            {{ item.field }}
+            {% if item.field.help_text %}
+            <div class="help">{{ item.field.help_text }}</div>
+            {% endif %}
+          </div>
+        </div>
+        {% endfor %}
+      {% endif %}
+    </fieldset>
+    {% endif %}
+  {% endfor %}
 
   <div class="submit-row">
     <input
@@ -54,5 +64,35 @@
   </div>
 
 </form>
+
+<script>
+document.querySelectorAll("select[data-lookup-url]").forEach((select) => {
+  const search = document.createElement("input");
+  search.type = "search";
+  search.placeholder = `Search ${select.dataset.lookupLabel}...`;
+  search.setAttribute("aria-label", search.placeholder);
+  select.before(search);
+
+  let timer;
+  search.addEventListener("input", () => {
+    clearTimeout(timer);
+    timer = setTimeout(async () => {
+      const current = select.value;
+      const response = await fetch(
+        `${select.dataset.lookupUrl}?q=${encodeURIComponent(search.value)}`,
+        {headers: {"Accept": "application/json"}},
+      );
+      if (!response.ok) return;
+      const {results} = await response.json();
+      select.replaceChildren(new Option(`Search ${select.dataset.lookupLabel}...`, ""));
+      results.forEach(({value, label}) => select.add(new Option(label, value)));
+      if (current && ![...select.options].some((option) => option.value === current)) {
+        select.add(new Option(current, current));
+      }
+      select.value = current;
+    }, 200);
+  });
+});
+</script>
 
 {% endblock %}

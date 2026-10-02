@@ -108,6 +108,92 @@ class GenericTableRepository:
 
             return cursor.fetchone()[0]
 
+    def search_lookup_rows(
+        self,
+        schema: str,
+        table: str,
+        *,
+        value_column: str,
+        display_columns: list[str],
+        search_columns: list[str],
+        query: str = "",
+        limit: int = 50,
+    ):
+        definition = self.introspector.inspect_table(schema, table)
+        known_columns = {column.name for column in definition.columns}
+        requested = {value_column, *display_columns, *search_columns}
+        unknown = requested - known_columns
+        if unknown:
+            raise ValueError(
+                "Unknown lookup columns: " + ", ".join(sorted(unknown))
+            )
+
+        connection = connections[self.database_alias]
+        quoted_schema = connection.ops.quote_name(definition.schema)
+        quoted_table = connection.ops.quote_name(definition.name)
+        selected_names = list(dict.fromkeys([value_column, *display_columns]))
+        selected = ", ".join(
+            connection.ops.quote_name(name) for name in selected_names
+        )
+        params = []
+        where_clause = ""
+        if query:
+            where_clause = " WHERE " + " OR ".join(
+                f"CAST({connection.ops.quote_name(name)} AS TEXT) ILIKE %s"
+                for name in search_columns
+            )
+            params.extend([f"%{query}%"] * len(search_columns))
+        order_by = ", ".join(
+            connection.ops.quote_name(name) for name in display_columns
+        )
+        sql = f"""
+            SELECT {selected}
+            FROM {quoted_schema}.{quoted_table}
+            {where_clause}
+            ORDER BY {order_by}
+            LIMIT %s
+        """
+        params.append(min(max(limit, 1), 100))
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+        results = []
+        for row in rows:
+            item = dict(zip(selected_names, row))
+            label = " — ".join(
+                str(item[name]) for name in display_columns if item[name] is not None
+            )
+            results.append({"value": str(item[value_column]), "label": label})
+        return results
+
+    def lookup_value_exists(
+        self,
+        schema: str,
+        table: str,
+        value_column: str,
+        value,
+    ) -> bool:
+        definition = self.introspector.inspect_table(schema, table)
+        known_columns = {column.name for column in definition.columns}
+        if value_column not in known_columns:
+            raise ValueError(f"Unknown lookup column: {value_column}")
+
+        connection = connections[self.database_alias]
+        quoted_schema = connection.ops.quote_name(definition.schema)
+        quoted_table = connection.ops.quote_name(definition.name)
+        quoted_value = connection.ops.quote_name(value_column)
+        sql = f"""
+            SELECT 1
+            FROM {quoted_schema}.{quoted_table}
+            WHERE {quoted_value} = %s
+            LIMIT 1
+        """
+        with connection.cursor() as cursor:
+            cursor.execute(sql, [value])
+            return cursor.fetchone() is not None
+
     def get_row(
         self,
         schema: str,

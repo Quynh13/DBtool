@@ -1,0 +1,103 @@
+{% extends "admin/base_site.html" %}
+
+{% block title %}Review {{ definition.schema }}.{{ definition.name }}{% endblock %}
+
+{% block content %}
+<p>
+  <a href="{% url 'dbtool:table_detail' definition.schema definition.name %}">← Back to table</a>
+  &nbsp;|&nbsp;
+  <a href="{% url 'dbtool:table_list' %}">Back to tables</a>
+</p>
+
+<h1>Review {{ definition.schema }}.{{ definition.name }}</h1>
+<p><strong>Current status:</strong> {{ status }}</p>
+<p><strong>Type:</strong> {{ definition.table_type }}</p>
+<p><strong>Primary key:</strong> {{ definition.primary_key|join:", "|default:"None" }}</p>
+
+<form method="post">
+  {% csrf_token %}
+  {{ table_form.non_field_errors }}
+
+  <fieldset class="module aligned">
+    <h2>Table configuration</h2>
+    <div class="form-row">{{ table_form.display_label.errors }}{{ table_form.display_label.label_tag }} {{ table_form.display_label }}</div>
+    <div class="form-row">{{ table_form.mutation_enabled.errors }}{{ table_form.mutation_enabled }} {{ table_form.mutation_enabled.label_tag }}</div>
+  </fieldset>
+
+  {% for column, form in column_forms %}
+  <fieldset class="module aligned column-review" data-prefix="{{ form.prefix }}">
+    <h2>{{ column.name }}</h2>
+    {{ form.non_field_errors }}
+
+    <p>
+      <strong>Physical metadata:</strong>
+      type={{ column.data_type }};
+      nullable={{ column.nullable|yesno:"yes,no" }};
+      default={{ column.default|default:"None" }};
+      PK={{ column.primary_key|yesno:"yes,no" }};
+      identity={{ column.identity|yesno:"yes,no" }};
+      generated={{ column.generated|yesno:"yes,no" }}
+    </p>
+
+    <div class="form-row">{{ form.reviewed.errors }}{{ form.reviewed }} {{ form.reviewed.label_tag }}</div>
+    <div class="form-row">{{ form.display_label.errors }}{{ form.display_label.label_tag }} {{ form.display_label }}</div>
+    <div class="form-row">{{ form.show_in_form.errors }}{{ form.show_in_form }} {{ form.show_in_form.label_tag }}</div>
+    <div class="form-row">{{ form.editable.errors }}{{ form.editable }} {{ form.editable.label_tag }}</div>
+    <div class="form-row">{{ form.required_on_insert.errors }}{{ form.required_on_insert }} {{ form.required_on_insert.label_tag }}</div>
+    <div class="form-row">{{ form.allow_clear_on_update.errors }}{{ form.allow_clear_on_update }} {{ form.allow_clear_on_update.label_tag }}</div>
+    <div class="form-row">{{ form.input_mode.errors }}{{ form.input_mode.label_tag }} {{ form.input_mode }}</div>
+    <div class="form-row">{{ form.help_text.errors }}{{ form.help_text.label_tag }} {{ form.help_text }}</div>
+
+    <div class="lookup-fields">
+      <h3>Lookup</h3>
+      <div class="form-row">{{ form.target_schema.errors }}{{ form.target_schema.label_tag }} {{ form.target_schema }}</div>
+      <div class="form-row">{{ form.target_table.errors }}{{ form.target_table.label_tag }} {{ form.target_table }}</div>
+      <div class="form-row">{{ form.target_value_column.errors }}{{ form.target_value_column.label_tag }} {{ form.target_value_column }}</div>
+      <div class="form-row">{{ form.display_columns.errors }}{{ form.display_columns.label_tag }} {{ form.display_columns }}</div>
+      <div class="form-row">{{ form.search_columns.errors }}{{ form.search_columns.label_tag }} {{ form.search_columns }}</div>
+      <div class="form-row">{{ form.allow_null.errors }}{{ form.allow_null }} {{ form.allow_null.label_tag }}</div>
+      <div class="form-row">{{ form.allow_arbitrary_value.errors }}{{ form.allow_arbitrary_value }} {{ form.allow_arbitrary_value.label_tag }}</div>
+    </div>
+  </fieldset>
+  {% endfor %}
+
+  <div class="submit-row"><input type="submit" value="Save" class="default"></div>
+</form>
+
+{{ catalog|json_script:"lookup-catalog" }}
+<script>
+const catalog = JSON.parse(document.getElementById("lookup-catalog").textContent);
+
+function replaceOptions(select, values) {
+  const selected = new Set([...select.selectedOptions].map((option) => option.value));
+  select.replaceChildren(...values.map((value) => new Option(value, value, false, selected.has(value))));
+}
+
+document.querySelectorAll(".column-review").forEach((section) => {
+  const prefix = section.dataset.prefix;
+  const field = (name) => section.querySelector(`[name="${prefix}-${name}"]`);
+  const mode = field("input_mode");
+  const lookup = section.querySelector(".lookup-fields");
+  const schema = field("target_schema");
+  const table = field("target_table");
+  const valueColumn = field("target_value_column");
+  const displayColumns = field("display_columns");
+  const searchColumns = field("search_columns");
+
+  const toggleLookup = () => lookup.hidden = mode.value !== "lookup";
+  const refreshColumns = () => {
+    const columns = catalog[schema.value]?.[table.value] || [];
+    [valueColumn, displayColumns, searchColumns].forEach((select) => replaceOptions(select, columns));
+  };
+  const refreshTables = () => {
+    replaceOptions(table, Object.keys(catalog[schema.value] || {}).sort());
+    refreshColumns();
+  };
+
+  mode.addEventListener("change", toggleLookup);
+  schema.addEventListener("change", refreshTables);
+  table.addEventListener("change", refreshColumns);
+  toggleLookup();
+});
+</script>
+{% endblock %}

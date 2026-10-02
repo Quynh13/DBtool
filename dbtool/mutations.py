@@ -5,7 +5,8 @@ from audit.models import OperationLog
 from dbtool.introspection import SchemaIntrospector
 from dbtool.repository import GenericTableRepository
 from dbtool.row_state import row_fingerprint
-from dbtool.safety import SafetyPolicy
+from dbtool.semantic_validation import SemanticValidationError, SemanticValidator
+from dbtool.semantics import EffectiveMetadataService
 
 
 class MutationNotAllowed(Exception):
@@ -23,8 +24,9 @@ class StaleRowError(Exception):
 class MutationService:
     def __init__(self):
         self.introspector = SchemaIntrospector()
-        self.policy = SafetyPolicy()
         self.repository = GenericTableRepository()
+        self.metadata = EffectiveMetadataService(introspector=self.introspector)
+        self.semantic_validator = SemanticValidator(self.repository)
 
     def insert(
         self,
@@ -39,7 +41,8 @@ class MutationService:
             table,
         )
 
-        capabilities = self.policy.evaluate(definition)
+        effective = self.metadata.resolve(definition)
+        capabilities = effective.capabilities
 
         if not capabilities.can_insert:
             raise MutationNotAllowed("INSERT is not allowed for this table.")
@@ -57,6 +60,11 @@ class MutationService:
                 "Attempted to write non-editable columns: "
                 + ", ".join(sorted(unknown_columns))
             )
+
+        try:
+            self.semantic_validator.validate_insert(effective, values)
+        except SemanticValidationError as exc:
+            raise MutationNotAllowed(str(exc)) from exc
 
         operation = OperationLog.objects.create(
             schema_name=schema,
@@ -123,7 +131,8 @@ class MutationService:
             table,
         )
 
-        capabilities = self.policy.evaluate(definition)
+        effective = self.metadata.resolve(definition)
+        capabilities = effective.capabilities
 
         if not capabilities.can_update:
             raise MutationNotAllowed("UPDATE is not allowed for this table.")
@@ -160,6 +169,15 @@ class MutationService:
                     raise StaleRowError(
                         "Row changed after the form was opened. Reload before updating."
                     )
+
+                try:
+                    self.semantic_validator.validate_update(
+                        effective,
+                        before,
+                        values,
+                    )
+                except SemanticValidationError as exc:
+                    raise MutationNotAllowed(str(exc)) from exc
 
                 operation = OperationLog.objects.create(
                     schema_name=schema,
@@ -229,7 +247,8 @@ class MutationService:
             table,
         )
 
-        capabilities = self.policy.evaluate(definition)
+        effective = self.metadata.resolve(definition)
+        capabilities = effective.capabilities
 
         if not capabilities.can_delete:
             raise MutationNotAllowed("DELETE is not allowed for this table.")

@@ -19,6 +19,16 @@ urlpatterns = [
         name="row_add",
     ),
     path(
+        "<str:schema>/<str:table>/review/",
+        admin.site.admin_view(views.table_review),
+        name="table_review",
+    ),
+    path(
+        "<str:schema>/<str:table>/lookup/<str:column>/",
+        admin.site.admin_view(views.lookup_search),
+        name="lookup_search",
+    ),
+    path(
         "<str:schema>/<str:table>/row/<str:row_token>/edit/",
         admin.site.admin_view(views.row_edit),
         name="row_edit",

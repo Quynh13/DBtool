@@ -9,7 +9,7 @@ Database Tables
 <h1>Database Tables</h1>
 
 <p>
-    Target database tables detected automatically from PostgreSQL metadata.
+    Select a configured table to view or safely edit target data.
 </p>
 
 <div class="module">
@@ -22,6 +22,7 @@ Database Tables
                 <th>Type</th>
                 <th>Primary Key</th>
                 <th>Safety</th>
+                <th>Action</th>
             </tr>
         </thead>
 
@@ -33,11 +34,21 @@ Database Tables
                 <td>
                     {{ table.schema }}
                 </td>
+                <td>
+                    {% if table.safety == "NEEDS REVIEW" %}
+                        <a href="{% url 'dbtool:table_review' table.schema table.name %}">{{ table.action }}</a>
+                    {% else %}
+                        <a href="{% url 'dbtool:table_detail' table.schema table.name %}">{{ table.action }}</a>
+                    {% endif %}
+                </td>
 
                 <td>
                     <a href="{% url 'dbtool:table_detail' table.schema table.name %}">
-                        {{ table.name }}
+                        {{ table.label }}
                     </a>
+                    {% if table.label != table.name %}
+                        <br><small>{{ table.name }}</small>
+                    {% endif %}
                 </td>
 
                 <td>
@@ -62,7 +73,7 @@ Database Tables
             {% empty %}
 
             <tr>
-                <td colspan="5">
+                <td colspan="6">
                     No tables found.
                 </td>
             </tr>
