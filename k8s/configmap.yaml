@@ -7,7 +7,7 @@ data:
   # Cấu hình môi trường Django
   DJANGO_DEBUG: "False"
   DJANGO_ALLOWED_HOSTS: "cki-tool.acv.local,10.10.74.87,127.0.0.1,localhost,*"
-  DJANGO_CSRF_TRUSTED_ORIGINS: "http://cki-tool.acv.local,https://cki-tool.acv.local,http://10.10.74.87:30080"
+  DJANGO_CSRF_TRUSTED_ORIGINS: "http://cki-tool.acv.local,https://cki-tool.acv.local,http://10.10.74.87:30702"
   DJANGO_SECURE_PROXY_SSL_HEADER: "True"
   DJANGO_USE_X_FORWARDED_HOST: "True"
 

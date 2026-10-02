@@ -10,7 +10,7 @@ spec:
   ports:
     - port: 80
       targetPort: 8000
-      nodePort: 30080 # Port mở trực tiếp trên node K3s để Nginx ngoài trỏ vào
+      nodePort: 30702 # Đổi sang 30702 (đồng bộ dải 30700 của sac-api, 30701 của sac-portal)
       protocol: TCP
       name: http
   selector:
