@@ -1,6 +1,6 @@
 from django.contrib import admin
 
-from dbtool.models import ColumnProfile, LookupMapping, TableProfile
+from dbtool.models import ColumnProfile, ConfigurationEvent, LookupMapping, TableProfile
 
 
 admin.site.index_template = "dbtool/admin_index.html"
@@ -62,3 +62,25 @@ class LookupMappingAdmin(admin.ModelAdmin):
         "target_schema",
         "target_table",
     )
+
+
+@admin.register(ConfigurationEvent)
+class ConfigurationEventAdmin(admin.ModelAdmin):
+    list_display = (
+        "created_at", "schema_name", "table_name", "action", "actor",
+        "was_released", "is_released",
+    )
+    list_filter = ("action",)
+    search_fields = ("schema_name", "table_name")
+
+    def has_view_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    def has_add_permission(self, request):
+        return False
+
+    def has_change_permission(self, request, obj=None):
+        return False
+
+    def has_delete_permission(self, request, obj=None):
+        return False

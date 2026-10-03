@@ -14,6 +14,13 @@
 <p><strong>Release status:</strong> {{ release_status }}</p>
 <p><strong>Type:</strong> {{ definition.table_type }}</p>
 <p><strong>Primary key:</strong> {{ definition.primary_key|join:", "|default:"None" }}</p>
+<p>Save configuration changes first. Release uses only saved settings.</p>
+{% if release_blockers %}
+<h2>Configuration issues</h2>
+<ul>
+  {% for reason in release_blockers %}<li>{{ reason }}</li>{% endfor %}
+</ul>
+{% endif %}
 
 {% if can_release %}
 <form method="post" action="{% url 'dbtool:table_release' definition.schema definition.name %}">

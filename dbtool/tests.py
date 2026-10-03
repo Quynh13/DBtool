@@ -17,7 +17,7 @@ from dbtool.row_state import (
     make_state_token,
     row_fingerprint,
 )
-from dbtool.models import ColumnProfile, LookupMapping, TableProfile
+from dbtool.models import ColumnProfile, ConfigurationEvent, LookupMapping, TableProfile
 from dbtool.forms import ColumnReviewForm, build_row_form
 from dbtool.mutations import MutationNotAllowed, MutationService
 from audit.models import OperationLog
@@ -700,6 +700,18 @@ class ReleaseWorkflowTests(SemanticFixture, TestCase):
         profile.refresh_from_db()
         self.assertFalse(profile.is_released)
 
+    def test_review_explains_unreviewed_column(self):
+        self.configure_attendance()
+        ColumnProfile.objects.filter(column_name="note").update(reviewed=False)
+        self.client.force_login(self.superuser)
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            response = self.client.get(reverse(
+                "dbtool:table_review",
+                kwargs={"schema": "public", "table": "attendance"},
+            ))
+        self.assertContains(response, "note: Semantic metadata has not been reviewed.")
+        self.assertNotContains(response, self.release_url)
+
     def test_complete_table_can_be_released_but_is_not_auto_released(self):
         self.configure_attendance()
         profile = TableProfile.objects.get(
@@ -726,6 +738,39 @@ class ReleaseWorkflowTests(SemanticFixture, TestCase):
         )
         profile.refresh_from_db()
         self.assertTrue(profile.is_released)
+        event = ConfigurationEvent.objects.get(action=ConfigurationEvent.Action.RELEASE)
+        self.assertEqual(event.actor, self.superuser)
+        self.assertEqual((event.was_released, event.is_released), (False, True))
+
+    def test_mutations_disabled_blocks_release_even_when_complete(self):
+        self.configure_attendance()
+        TableProfile.objects.filter(table_name="attendance").update(
+            mutation_enabled=False
+        )
+        self.client.force_login(self.superuser)
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            review = self.client.get(reverse(
+                "dbtool:table_review",
+                kwargs={"schema": "public", "table": "attendance"},
+            ))
+            response = self.client.post(self.release_url)
+        self.assertContains(review, "Enable mutations in Table configuration")
+        self.assertNotContains(review, self.release_url)
+        self.assertEqual(response.status_code, 403)
+        self.assertFalse(ConfigurationEvent.objects.exists())
+
+    def test_release_rolls_back_if_event_cannot_be_written(self):
+        self.configure_attendance()
+        self.client.force_login(self.superuser)
+        with (
+            patch("dbtool.views.SchemaIntrospector", return_value=self.introspector),
+            patch("dbtool.views.ConfigurationEvent.objects.create", side_effect=RuntimeError("log failed")),
+        ):
+            with self.assertRaisesMessage(RuntimeError, "log failed"):
+                self.client.post(self.release_url)
+        self.assertFalse(
+            TableProfile.objects.get(table_name="attendance").is_released
+        )
 
     def test_user_table_list_only_contains_released_tables(self):
         self.configure_attendance()
@@ -844,6 +889,9 @@ class ReleaseWorkflowTests(SemanticFixture, TestCase):
         )
         profile.refresh_from_db()
         self.assertFalse(profile.is_released)
+        event = ConfigurationEvent.objects.get(action=ConfigurationEvent.Action.UNRELEASE)
+        self.assertEqual(event.actor, self.superuser)
+        self.assertEqual((event.was_released, event.is_released), (True, False))
         self.assertEqual(profile.column_profiles.count(), column_count)
         self.assertEqual(
             LookupMapping.objects.filter(
@@ -962,6 +1010,7 @@ class AutoUnreleaseTests(SemanticFixture, TestCase):
 
         self.assertRedirects(response, self.url, fetch_redirect_response=False)
         self.assert_released()
+        self.assertFalse(ConfigurationEvent.objects.exists())
 
     def test_successful_table_profile_change_unreleases(self):
         data = self.review_data()
@@ -973,6 +1022,15 @@ class AutoUnreleaseTests(SemanticFixture, TestCase):
         self.assert_unreleased()
         self.profile.refresh_from_db()
         self.assertEqual(self.profile.display_label, "Attendance Events")
+        self.assertCountEqual(
+            ConfigurationEvent.objects.values_list("action", flat=True),
+            [ConfigurationEvent.Action.CONFIG_CHANGED,
+             ConfigurationEvent.Action.AUTO_UNRELEASE],
+        )
+        self.assertEqual(
+            ConfigurationEvent.objects.get(action=ConfigurationEvent.Action.CONFIG_CHANGED).actor,
+            self.user,
+        )
 
     def test_failed_save_does_not_unrelease_or_persist_changes(self):
         data = self.review_data()
@@ -986,6 +1044,7 @@ class AutoUnreleaseTests(SemanticFixture, TestCase):
         self.assert_released()
         self.profile.refresh_from_db()
         self.assertEqual(self.profile.display_label, "Attendance")
+        self.assertFalse(ConfigurationEvent.objects.exists())
 
     def test_persistence_failure_rolls_back_change_and_unrelease(self):
         data = self.review_data()
@@ -1001,6 +1060,7 @@ class AutoUnreleaseTests(SemanticFixture, TestCase):
         self.assert_released()
         self.profile.refresh_from_db()
         self.assertEqual(self.profile.display_label, "Attendance")
+        self.assertFalse(ConfigurationEvent.objects.exists())
 
     def test_lookup_mapping_admin_change_unreleases(self):
         lookup = LookupMapping.objects.get(
@@ -1022,6 +1082,11 @@ class AutoUnreleaseTests(SemanticFixture, TestCase):
 
         self.assertEqual(response.status_code, 302)
         self.assert_unreleased()
+        self.assertEqual(
+            ConfigurationEvent.objects.filter(
+                action=ConfigurationEvent.Action.AUTO_UNRELEASE
+            ).count(), 1,
+        )
         lookup.refresh_from_db()
         self.assertEqual(lookup.target_value_column, "name")
 

@@ -14,7 +14,15 @@ from dbtool.forms import (
     populate_lookup_choices,
 )
 from dbtool.introspection import SchemaIntrospector
-from dbtool.models import ColumnProfile, LookupMapping, TableProfile
+from dbtool.models import (
+    COLUMN_SEMANTIC_FIELDS,
+    LOOKUP_SEMANTIC_FIELDS,
+    TABLE_SEMANTIC_FIELDS,
+    ColumnProfile,
+    ConfigurationEvent,
+    LookupMapping,
+    TableProfile,
+)
 from dbtool.mutations import (
     MutationService,
     RowNotFound,
@@ -49,6 +57,42 @@ from dbtool.rollback import (
 
 
 PAGE_SIZE = 50
+
+
+def _can_release(effective):
+    return (
+        effective.configuration_status == COMPLETE
+        and effective.status == READY
+        and effective.profile is not None
+        and not effective.profile.is_released
+    )
+
+
+def _release_blockers(effective):
+    reasons = list(effective.warnings)
+    if effective.profile and not effective.profile.mutation_enabled:
+        reasons.append("Enable mutations in Table configuration before Release.")
+    return reasons
+
+
+def _semantic_snapshot(profile):
+    if profile is None:
+        return None
+    columns = []
+    for column in profile.column_profiles.all():
+        try:
+            lookup = column.lookup_mapping
+        except LookupMapping.DoesNotExist:
+            lookup = None
+        columns.append((
+            tuple(getattr(column, field) for field in COLUMN_SEMANTIC_FIELDS),
+            tuple(getattr(lookup, field) for field in LOOKUP_SEMANTIC_FIELDS)
+            if lookup else None,
+        ))
+    return (
+        tuple(getattr(profile, field) for field in TABLE_SEMANTIC_FIELDS),
+        tuple(sorted(columns, key=lambda item: item[0][1])),
+    )
 
 
 def _display_value(value):
@@ -259,7 +303,7 @@ def database_configuration(request):
                     kwargs={"schema": schema, "table": table_name},
                 ),
                 "can_release": (
-                    effective.configuration_status == COMPLETE and not released
+                    _can_release(effective)
                 ),
                 "can_unrelease": released,
                 "release_url": reverse(
@@ -443,6 +487,8 @@ def table_review(request, schema, table):
         if profile
         else {}
     )
+    previous_semantics = _semantic_snapshot(profile)
+    was_released = bool(profile and profile.is_released)
     catalog = _metadata_catalog(introspector)
     physical = SafetyPolicy().evaluate(definition)
     table_initial = {
@@ -534,10 +580,25 @@ def table_review(request, schema, table):
                             column_profile=column_profile
                         ).delete()
 
+                saved_profile = (
+                    TableProfile.objects.filter(pk=profile.pk)
+                    .prefetch_related("column_profiles__lookup_mapping")
+                    .get()
+                )
+                if _semantic_snapshot(saved_profile) != previous_semantics:
+                    ConfigurationEvent.objects.create(
+                        schema_name=schema,
+                        table_name=table,
+                        action=ConfigurationEvent.Action.CONFIG_CHANGED,
+                        actor=request.user,
+                        was_released=was_released,
+                        is_released=saved_profile.is_released,
+                    )
+
             status = EffectiveMetadataService(
                 introspector=introspector
-            ).resolve(definition).status
-            messages.success(request, f"Configuration saved. Status: {status}.")
+            ).resolve(definition).configuration_status
+            messages.success(request, f"Configuration saved. Status: {status}. Release separately when ready.")
             return redirect(
                 "dbtool:table_review",
                 schema=schema,
@@ -560,9 +621,7 @@ def table_review(request, schema, table):
                 else "NOT RELEASED"
             ),
             "can_release": (
-                effective.configuration_status == COMPLETE
-                and effective.profile is not None
-                and not effective.profile.is_released
+                _can_release(effective)
             ),
             "can_unrelease": bool(
                 effective.profile and effective.profile.is_released
@@ -571,6 +630,7 @@ def table_review(request, schema, table):
             "column_forms": column_forms,
             "catalog": catalog,
             "definition_columns": [column.name for column in definition.columns],
+            "release_blockers": _release_blockers(effective),
         },
     )
 
@@ -586,20 +646,24 @@ def table_release(request, schema, table):
     except ValueError as exc:
         raise Http404(str(exc)) from exc
 
-    effective = EffectiveMetadataService(introspector=introspector).resolve(
-        definition
-    )
-    if (
-        effective.configuration_status != COMPLETE
-        or effective.profile is None
-        or effective.profile.is_released
-    ):
-        raise PermissionDenied(
-            "Only complete, unreleased table configuration can be released."
+    with transaction.atomic():
+        effective = EffectiveMetadataService(introspector=introspector).resolve(
+            definition
         )
-
-    effective.profile.is_released = True
-    effective.profile.save(update_fields=["is_released"])
+        if not _can_release(effective):
+            raise PermissionDenied(
+                "Only complete, mutation-enabled, unreleased table configuration can be released."
+            )
+        effective.profile.is_released = True
+        effective.profile.save(update_fields=["is_released"])
+        ConfigurationEvent.objects.create(
+            schema_name=schema,
+            table_name=table,
+            action=ConfigurationEvent.Action.RELEASE,
+            actor=request.user,
+            was_released=False,
+            is_released=True,
+        )
     messages.success(request, f"{schema}.{table} released.")
     return redirect("dbtool:database_configuration")
 
@@ -614,16 +678,24 @@ def table_unrelease(request, schema, table):
     except ValueError as exc:
         raise Http404(str(exc)) from exc
 
-    profile = get_object_or_404(
-        TableProfile,
-        schema_name=schema,
-        table_name=table,
-    )
-    if not profile.is_released:
-        raise PermissionDenied("Table is not released.")
-
-    profile.is_released = False
-    profile.save(update_fields=["is_released"])
+    with transaction.atomic():
+        profile = get_object_or_404(
+            TableProfile,
+            schema_name=schema,
+            table_name=table,
+        )
+        if not profile.is_released:
+            raise PermissionDenied("Table is not released.")
+        profile.is_released = False
+        profile.save(update_fields=["is_released"])
+        ConfigurationEvent.objects.create(
+            schema_name=schema,
+            table_name=table,
+            action=ConfigurationEvent.Action.UNRELEASE,
+            actor=request.user,
+            was_released=True,
+            is_released=False,
+        )
     messages.success(request, f"{schema}.{table} unreleased.")
     return redirect("dbtool:database_configuration")
 

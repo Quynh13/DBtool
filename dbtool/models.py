@@ -1,4 +1,5 @@
-from django.db import models
+from django.conf import settings
+from django.db import models, transaction
 from django.db.models.signals import post_delete, post_save, pre_save
 from django.dispatch import receiver
 
@@ -88,6 +89,27 @@ class LookupMapping(models.Model):
         )
 
 
+class ConfigurationEvent(models.Model):
+    class Action(models.TextChoices):
+        CONFIG_CHANGED = "CONFIG_CHANGED", "Configuration changed"
+        RELEASE = "RELEASE", "Released"
+        UNRELEASE = "UNRELEASE", "Unreleased"
+        AUTO_UNRELEASE = "AUTO_UNRELEASE", "Automatically unreleased"
+
+    schema_name = models.CharField(max_length=63)
+    table_name = models.CharField(max_length=63)
+    action = models.CharField(max_length=24, choices=Action.choices)
+    actor = models.ForeignKey(
+        settings.AUTH_USER_MODEL, null=True, blank=True, on_delete=models.SET_NULL
+    )
+    was_released = models.BooleanField(default=False)
+    is_released = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ("-created_at",)
+
+
 TABLE_SEMANTIC_FIELDS = (
     "schema_name",
     "table_name",
@@ -134,10 +156,19 @@ def _has_semantic_change(previous, instance, fields):
 def _unrelease_profiles(profile_ids):
     profile_ids = {profile_id for profile_id in profile_ids if profile_id}
     if profile_ids:
-        TableProfile.objects.filter(
-            pk__in=profile_ids,
-            is_released=True,
-        ).update(is_released=False)
+        with transaction.atomic():
+            for profile in TableProfile.objects.filter(pk__in=profile_ids, is_released=True):
+                changed = TableProfile.objects.filter(pk=profile.pk, is_released=True).update(
+                    is_released=False
+                )
+                if changed:
+                    ConfigurationEvent.objects.create(
+                        schema_name=profile.schema_name,
+                        table_name=profile.table_name,
+                        action=ConfigurationEvent.Action.AUTO_UNRELEASE,
+                        was_released=True,
+                        is_released=False,
+                    )
 
 
 def _profile_ids_for_columns(column_profile_ids):
