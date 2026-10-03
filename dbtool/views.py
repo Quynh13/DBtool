@@ -154,9 +154,13 @@ def _form_sections(form, effective, mode):
                 "Database managed"
                 if column.physical.identity or column.physical.generated
                 else (
-                    "Filled from lookup"
-                    if column.capability.can_insert or column.capability.can_update
-                    else "Read only"
+                    "Fixed on insert"
+                    if column.input_mode == ColumnProfile.InputMode.FIXED
+                    else (
+                        "Filled from lookup"
+                        if column.capability.can_insert or column.capability.can_update
+                        else "Read only"
+                    )
                 )
             ),
         }
@@ -185,6 +189,7 @@ def _column_review_initial(column, profile, capability):
             "required_on_insert": capability.required_on_insert,
             "allow_clear_on_update": column.nullable,
             "input_mode": ColumnProfile.InputMode.TEXT,
+            "fixed_insert_value": "",
         }
 
     initial = {
@@ -195,6 +200,7 @@ def _column_review_initial(column, profile, capability):
         "required_on_insert": profile.required_on_insert,
         "allow_clear_on_update": profile.allow_clear_on_update,
         "input_mode": profile.input_mode,
+        "fixed_insert_value": profile.fixed_insert_value,
         "help_text": profile.help_text,
     }
     try:
@@ -516,6 +522,7 @@ def table_review(request, schema, table):
                     prefix=f"column-{index}",
                     catalog=catalog,
                     destination_columns=[item.name for item in definition.columns],
+                    physical_column=column,
                     initial=_column_review_initial(
                         column,
                         column_profile,
@@ -558,6 +565,7 @@ def table_review(request, schema, table):
                                     "allow_clear_on_update"
                                 ],
                                 "input_mode": data["input_mode"],
+                                "fixed_insert_value": data["fixed_insert_value"],
                                 "help_text": data["help_text"],
                             },
                         )

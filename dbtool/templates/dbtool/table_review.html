@@ -66,6 +66,7 @@
     <div class="form-row">{{ form.required_on_insert.errors }}{{ form.required_on_insert }} {{ form.required_on_insert.label_tag }}</div>
     <div class="form-row">{{ form.allow_clear_on_update.errors }}{{ form.allow_clear_on_update }} {{ form.allow_clear_on_update.label_tag }}</div>
     <div class="form-row">{{ form.input_mode.errors }}{{ form.input_mode.label_tag }} {{ form.input_mode }}</div>
+    <div class="fixed-fields form-row">{{ form.fixed_insert_value.errors }}{{ form.fixed_insert_value.label_tag }} {{ form.fixed_insert_value }} <span class="help">{{ form.fixed_insert_value.help_text }}</span></div>
     <div class="form-row">{{ form.help_text.errors }}{{ form.help_text.label_tag }} {{ form.help_text }}</div>
 
     <div class="lookup-fields">
@@ -103,6 +104,7 @@ document.querySelectorAll(".column-review").forEach((section) => {
   const field = (name) => section.querySelector(`[name="${prefix}-${name}"]`);
   const mode = field("input_mode");
   const lookup = section.querySelector(".lookup-fields");
+  const fixed = section.querySelector(".fixed-fields");
   const schema = field("target_schema");
   const table = field("target_table");
   const valueColumn = field("target_value_column");
@@ -140,7 +142,10 @@ document.querySelectorAll(".column-review").forEach((section) => {
     })));
   });
 
-  const toggleLookup = () => lookup.hidden = mode.value !== "lookup";
+  const toggleMode = () => {
+    lookup.hidden = mode.value !== "lookup";
+    fixed.hidden = mode.value !== "fixed";
+  };
   const refreshColumns = () => {
     const columns = catalog[schema.value]?.[table.value] || [];
     [valueColumn, displayColumns, searchColumns].forEach((select) => replaceOptions(select, columns));
@@ -153,10 +158,16 @@ document.querySelectorAll(".column-review").forEach((section) => {
     refreshColumns();
   };
 
-  mode.addEventListener("change", toggleLookup);
+  mode.addEventListener("change", () => {
+    if (mode.value === "fixed") {
+      field("show_in_form").checked = false;
+      field("editable").checked = false;
+    }
+    toggleMode();
+  });
   schema.addEventListener("change", refreshTables);
   table.addEventListener("change", refreshColumns);
-  toggleLookup();
+  toggleMode();
 });
 </script>
 {% endblock %}

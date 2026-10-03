@@ -1,5 +1,8 @@
 from dataclasses import dataclass, field, replace
 
+from django.core.exceptions import ValidationError
+
+from dbtool.forms import parse_fixed_insert_value
 from dbtool.introspection import ColumnDefinition, TableDefinition
 from dbtool.models import ColumnProfile, LookupMapping, TableProfile
 from dbtool.safety import ColumnCapability, SafetyPolicy, TableCapabilities
@@ -93,6 +96,8 @@ class EffectiveMetadataService:
             mapped = column.name in mapped_targets
             lookup = None
             issues = []
+            fixed = False
+            fixed_valid = False
 
             if column_profile is None:
                 issues.append("Semantic metadata is not configured.")
@@ -116,13 +121,30 @@ class EffectiveMetadataService:
                 )
                 input_mode = column_profile.input_mode
                 help_text = column_profile.help_text
+                fixed = input_mode == ColumnProfile.InputMode.FIXED
+
+                if fixed:
+                    if show_in_form or editable:
+                        issues.append("Fixed insert values must be hidden and not editable.")
+                    if mapped:
+                        issues.append("Fixed insert values cannot be lookup outputs.")
+                    if not capability.can_insert:
+                        issues.append("Physical metadata does not allow a fixed insert value.")
+                    try:
+                        parse_fixed_insert_value(column, column_profile.fixed_insert_value)
+                    except ValidationError:
+                        issues.append("Fixed insert value is invalid for this column type.")
+                    else:
+                        fixed_valid = True
+                elif column_profile.fixed_insert_value:
+                    issues.append("Fixed insert value requires fixed input mode.")
 
                 if not column_profile.reviewed:
                     issues.append("Semantic metadata has not been reviewed.")
 
-                if editable and not show_in_form and not mapped:
+                if editable and not show_in_form and not mapped and not fixed:
                     issues.append("Editable columns must be shown on the form.")
-                if mapped and not editable:
+                if mapped and not editable and not fixed:
                     issues.append("Mapped columns must be editable.")
                 if mapped and input_mode == ColumnProfile.InputMode.LOOKUP:
                     issues.append("Mapped columns cannot also be lookup inputs.")
@@ -160,7 +182,8 @@ class EffectiveMetadataService:
                     issues.append("Lookup mapping requires lookup input mode.")
 
                 if required and not (
-                    capability.can_insert and editable and (show_in_form or mapped)
+                    capability.can_insert
+                    and (fixed and fixed_valid or editable and (show_in_form or mapped))
                 ):
                     issues.append(
                         "Required insert value cannot be entered on the form."
@@ -169,10 +192,11 @@ class EffectiveMetadataService:
             effective_capability = replace(
                 capability,
                 can_insert=(
-                    capability.can_insert and editable and (show_in_form or mapped)
+                    capability.can_insert
+                    and (fixed and fixed_valid or editable and (show_in_form or mapped))
                 ),
                 can_update=(
-                    capability.can_update and editable and (show_in_form or mapped)
+                    capability.can_update and not fixed and editable and (show_in_form or mapped)
                 ),
                 required_on_insert=required,
                 warnings=capability.warnings + issues,

@@ -1686,3 +1686,178 @@ class MultiOutputLookupTests(TestCase):
             RollbackService().rollback(operation)
         operation.refresh_from_db()
         self.assertEqual(operation.status, OperationLog.Status.APPLIED)
+
+
+class FixedInsertTests(TestCase):
+    def setUp(self):
+        self.definition = TableDefinition(
+            schema="public", name="manual_summary", table_type="BASE TABLE",
+            primary_key=["Id"], columns=[
+                ColumnDefinition("Id", "integer", False, None, True, True, False),
+                ColumnDefinition("Name", "text", False, None, False, False, False),
+                ColumnDefinition("IsEdit", "boolean", False, None, False, False, False),
+            ],
+        )
+        self.introspector = StubIntrospector(self.definition)
+        self.profile = TableProfile.objects.create(
+            schema_name="public", table_name="manual_summary",
+            mutation_enabled=True,
+        )
+        ColumnProfile.objects.create(
+            table_profile=self.profile, column_name="Id", reviewed=True,
+            show_in_form=False, editable=False,
+        )
+        ColumnProfile.objects.create(
+            table_profile=self.profile, column_name="Name", reviewed=True,
+            show_in_form=True, editable=True,
+        )
+        self.fixed = ColumnProfile.objects.create(
+            table_profile=self.profile, column_name="IsEdit", reviewed=True,
+            show_in_form=False, editable=False,
+            input_mode=ColumnProfile.InputMode.FIXED, fixed_insert_value="true",
+        )
+        self.user = get_user_model().objects.create_user(username="fixed-test")
+        self.service = MutationService()
+        self.service.introspector = self.introspector
+        self.service.metadata = EffectiveMetadataService(introspector=self.introspector)
+        self.service.repository.introspector = self.introspector
+
+    def release(self):
+        TableProfile.objects.filter(pk=self.profile.pk).update(is_released=True)
+
+    def test_fixed_column_is_hidden_and_configuration_can_complete(self):
+        effective = self.service.metadata.resolve(self.definition)
+        self.assertEqual(effective.configuration_status, COMPLETE)
+        form = build_row_form(effective, mode="insert")({"Name": "Ada", "IsEdit": "false"})
+        self.assertTrue(form.is_valid(), form.errors)
+        self.assertNotIn("IsEdit", form.fields)
+        self.assertNotIn("IsEdit", form.cleaned_data)
+
+    def test_insert_overrides_client_value_and_audits_fixed_value(self):
+        self.release()
+        captured = {}
+
+        def insert_row(schema, table, values):
+            captured.update(values)
+            return {"Id": 9, **values}
+
+        self.service.repository.insert_row = insert_row
+        with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+            row, operation = self.service.insert(
+                schema="public", table="manual_summary",
+                values={"Name": "Ada", "IsEdit": False}, actor=self.user,
+            )
+        self.assertIs(captured["IsEdit"], True)
+        self.assertIs(row["IsEdit"], True)
+        self.assertEqual(operation.status, OperationLog.Status.APPLIED)
+
+    def test_false_fixed_boolean_is_inserted_as_false(self):
+        self.fixed.fixed_insert_value = "false"
+        self.fixed.save(update_fields=["fixed_insert_value"])
+        self.release()
+        captured = {}
+
+        def insert_row(schema, table, values):
+            captured.update(values)
+            return {"Id": 10, **values}
+
+        self.service.repository.insert_row = insert_row
+        with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+            self.service.insert(
+                schema="public", table="manual_summary",
+                values={"Name": "Ada"}, actor=self.user,
+            )
+        self.assertIs(captured["IsEdit"], False)
+
+    def test_invalid_fixed_value_blocks_completion_and_insert(self):
+        self.fixed.fixed_insert_value = "not-a-boolean"
+        self.fixed.save(update_fields=["fixed_insert_value"])
+        effective = self.service.metadata.resolve(self.definition)
+        self.assertEqual(effective.configuration_status, INCOMPLETE)
+        with patch.object(self.service.repository, "insert_row") as insert_row:
+            with self.assertRaises(MutationNotAllowed):
+                self.service.insert(
+                    schema="public", table="manual_summary",
+                    values={"Name": "Ada"}, actor=self.user,
+                )
+        insert_row.assert_not_called()
+        self.assertFalse(OperationLog.objects.exists())
+
+    def test_no_op_keeps_release_but_actual_fixed_change_unreleases(self):
+        self.release()
+        self.fixed.save(update_fields=["fixed_insert_value"])
+        self.profile.refresh_from_db()
+        self.assertTrue(self.profile.is_released)
+        self.fixed.fixed_insert_value = "false"
+        self.fixed.save(update_fields=["fixed_insert_value"])
+        self.profile.refresh_from_db()
+        self.assertFalse(self.profile.is_released)
+
+    def test_fixed_value_form_validates_physical_type_and_visibility(self):
+        base = {
+            "display_label": "Is edit", "input_mode": ColumnProfile.InputMode.FIXED,
+            "fixed_insert_value": "true", "reviewed": "on",
+        }
+        column = self.definition.columns[2]
+        form = ColumnReviewForm(base, catalog={}, physical_column=column)
+        self.assertTrue(form.is_valid(), form.errors)
+        for changes in ({"fixed_insert_value": "bad"}, {"fixed_insert_value": ""},
+                        {"show_in_form": "on"}):
+            form = ColumnReviewForm({**base, **changes}, catalog={}, physical_column=column)
+            self.assertFalse(form.is_valid())
+
+    def test_fixed_input_uses_physical_type_without_changing_stored_value(self):
+        cases = [
+            ("boolean", "select", "false"),
+            ("integer", "number", "0"),
+            ("numeric", "number", "1.5"),
+            ("date", "date", "2026-10-04"),
+            ("timestamp without time zone", "datetime-local", "2026-10-04T12:30"),
+            ("time without time zone", "time", "12:30"),
+            ("jsonb", "textarea", '{"active": true}'),
+            ("uuid", "text", "9c13d123-4c62-4766-bc9a-931eb973ac09"),
+        ]
+        for data_type, widget_type, value in cases:
+            with self.subTest(data_type=data_type):
+                column = ColumnDefinition(
+                    "Fixed", data_type, False, None, False, False, False,
+                )
+                form = ColumnReviewForm(
+                    {"input_mode": ColumnProfile.InputMode.FIXED,
+                     "fixed_insert_value": value},
+                    catalog={}, physical_column=column,
+                )
+                widget = form.fields["fixed_insert_value"].widget
+                if widget_type == "textarea":
+                    self.assertEqual(widget.__class__.__name__, "Textarea")
+                else:
+                    self.assertEqual(widget.input_type, widget_type)
+                self.assertTrue(form.is_valid(), form.errors)
+                self.assertEqual(form.cleaned_data["fixed_insert_value"], value)
+                if data_type == "numeric":
+                    self.assertEqual(widget.attrs["step"], "any")
+
+        for data_type, invalid in (("integer", "1.5"), ("date", "not-a-date"),
+                                   ("jsonb", "{bad json}")):
+            with self.subTest(invalid_type=data_type):
+                column = ColumnDefinition(
+                    "Fixed", data_type, False, None, False, False, False,
+                )
+                form = ColumnReviewForm(
+                    {"input_mode": ColumnProfile.InputMode.FIXED,
+                     "fixed_insert_value": invalid},
+                    catalog={}, physical_column=column,
+                )
+                self.assertFalse(form.is_valid())
+                self.assertIn("fixed_insert_value", form.errors)
+
+    def test_boolean_fixed_select_has_no_implicit_true_and_preserves_false(self):
+        column = self.definition.columns[2]
+        blank = ColumnReviewForm(catalog={}, physical_column=column)
+        self.assertIn('value=""', str(blank["fixed_insert_value"]))
+        self.assertIn('Select True or False', str(blank["fixed_insert_value"]))
+        configured = ColumnReviewForm(
+            catalog={}, physical_column=column,
+            initial={"fixed_insert_value": "false"},
+        )
+        self.assertIn('value="false" selected', str(configured["fixed_insert_value"]))

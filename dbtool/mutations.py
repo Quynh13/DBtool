@@ -1,8 +1,11 @@
 from django.db import transaction
+from django.core.exceptions import ValidationError
 
 from audit.codec import encode_row
 from audit.models import OperationLog, ToolOwnedRecord
 from dbtool.introspection import SchemaIntrospector
+from dbtool.forms import parse_fixed_insert_value
+from dbtool.models import ColumnProfile
 from dbtool.repository import GenericTableRepository
 from dbtool.ownership import key_digest, owned_record
 from dbtool.row_state import row_fingerprint
@@ -86,6 +89,17 @@ class MutationService:
         try:
             with transaction.atomic(using="target"):
                 values = self._apply_lookup_outputs(effective, values)
+                values = values.copy()
+                for name, column in effective.columns.items():
+                    if column.input_mode == ColumnProfile.InputMode.FIXED:
+                        try:
+                            values[name] = parse_fixed_insert_value(
+                                column.physical, column.profile.fixed_insert_value
+                            )
+                        except ValidationError as exc:
+                            raise MutationNotAllowed(
+                                f"Fixed insert value for {column.label} is invalid."
+                            ) from exc
                 allowed_columns = {
                     name for name, capability in capabilities.columns.items()
                     if capability.can_insert

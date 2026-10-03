@@ -31,6 +31,7 @@ class ColumnProfile(models.Model):
     class InputMode(models.TextChoices):
         TEXT = "text", "Direct input"
         LOOKUP = "lookup", "Lookup"
+        FIXED = "fixed", "Fixed on insert"
 
     table_profile = models.ForeignKey(
         TableProfile,
@@ -48,6 +49,7 @@ class ColumnProfile(models.Model):
         choices=InputMode.choices,
         default=InputMode.TEXT,
     )
+    fixed_insert_value = models.TextField(blank=True, default="")
     help_text = models.TextField(blank=True)
     reviewed = models.BooleanField(
         default=False,
@@ -125,6 +127,7 @@ COLUMN_SEMANTIC_FIELDS = (
     "required_on_insert",
     "allow_clear_on_update",
     "input_mode",
+    "fixed_insert_value",
     "help_text",
     "reviewed",
 )

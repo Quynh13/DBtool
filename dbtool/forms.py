@@ -23,6 +23,12 @@ class ColumnReviewForm(forms.Form):
     required_on_insert = forms.BooleanField(required=False)
     allow_clear_on_update = forms.BooleanField(required=False)
     input_mode = forms.ChoiceField(choices=ColumnProfile.InputMode.choices)
+    fixed_insert_value = forms.CharField(
+        required=False,
+        strip=False,
+        label="Fixed INSERT value",
+        help_text="Supplied by the server on Add; not shown on Add or Edit forms.",
+    )
     help_text = forms.CharField(
         required=False,
         widget=forms.Textarea(attrs={"rows": 2}),
@@ -36,10 +42,25 @@ class ColumnReviewForm(forms.Form):
     allow_arbitrary_value = forms.BooleanField(required=False)
     output_mappings = forms.JSONField(required=False, widget=forms.HiddenInput)
 
-    def __init__(self, *args, catalog, destination_columns=(), **kwargs):
+    def __init__(self, *args, catalog, destination_columns=(), physical_column=None, **kwargs):
         super().__init__(*args, **kwargs)
         self.catalog = catalog
         self.destination_columns = set(destination_columns)
+        self.physical_column = physical_column
+        if physical_column is not None:
+            fixed_field = self.fields["fixed_insert_value"]
+            if physical_column.data_type == "boolean":
+                fixed_field.widget = forms.Select(choices=[
+                    ("", "Select True or False"),
+                    ("true", "True"),
+                    ("false", "False"),
+                ])
+            else:
+                fixed_field.widget = _field_for_column(physical_column, True).widget
+                if physical_column.data_type in {
+                    "numeric", "decimal", "real", "double precision",
+                }:
+                    fixed_field.widget.attrs["step"] = "any"
         schemas = sorted(catalog)
         selected_schema = self._selected("target_schema")
         if selected_schema not in catalog:
@@ -68,6 +89,22 @@ class ColumnReviewForm(forms.Form):
 
     def clean(self):
         cleaned = super().clean()
+        if cleaned.get("input_mode") == ColumnProfile.InputMode.FIXED:
+            if cleaned.get("show_in_form") or cleaned.get("editable"):
+                self.add_error("input_mode", "Fixed values must be hidden and not editable.")
+            if not cleaned.get("fixed_insert_value"):
+                self.add_error("fixed_insert_value", "Enter a fixed INSERT value.")
+            elif self.physical_column is not None:
+                try:
+                    parse_fixed_insert_value(
+                        self.physical_column, cleaned["fixed_insert_value"]
+                    )
+                except forms.ValidationError:
+                    self.add_error("fixed_insert_value", "Invalid value for this column type.")
+            else:
+                self.add_error("fixed_insert_value", "Physical column is unavailable.")
+        else:
+            cleaned["fixed_insert_value"] = ""
         if cleaned.get("input_mode") != ColumnProfile.InputMode.LOOKUP:
             cleaned["output_mappings"] = []
             return cleaned
@@ -213,6 +250,13 @@ def _field_for_column(column, required: bool, *, label=None, help_text=""):
         )
 
     return forms.CharField(empty_value=None, **common)
+
+
+def parse_fixed_insert_value(column, raw):
+    field = _field_for_column(column, True)
+    if isinstance(field, forms.CharField):
+        field.strip = False
+    return field.clean(raw)
 
 
 def build_row_form(
