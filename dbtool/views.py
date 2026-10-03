@@ -106,7 +106,11 @@ def _form_sections(form, effective, mode):
             "reason": (
                 "Database managed"
                 if column.physical.identity or column.physical.generated
-                else "Read only"
+                else (
+                    "Filled from lookup"
+                    if column.capability.can_insert or column.capability.can_update
+                    else "Read only"
+                )
             ),
         }
         for name, column in effective.columns.items()
@@ -163,6 +167,7 @@ def _column_review_initial(column, profile, capability):
             "target_value_column": lookup.target_value_column,
             "display_columns": lookup.display_columns,
             "search_columns": lookup.search_columns,
+            "output_mappings": lookup.output_mappings,
             "allow_null": lookup.allow_null,
             "allow_arbitrary_value": lookup.allow_arbitrary_value,
         }
@@ -459,6 +464,7 @@ def table_review(request, schema, table):
                     request.POST or None,
                     prefix=f"column-{index}",
                     catalog=catalog,
+                    destination_columns=[item.name for item in definition.columns],
                     initial=_column_review_initial(
                         column,
                         column_profile,
@@ -516,6 +522,7 @@ def table_review(request, schema, table):
                                 ],
                                 "display_columns": data["display_columns"],
                                 "search_columns": data["search_columns"],
+                                "output_mappings": data["output_mappings"],
                                 "allow_null": data["allow_null"],
                                 "allow_arbitrary_value": data[
                                     "allow_arbitrary_value"
@@ -563,6 +570,7 @@ def table_review(request, schema, table):
             "table_form": table_form,
             "column_forms": column_forms,
             "catalog": catalog,
+            "definition_columns": [column.name for column in definition.columns],
         },
     )
 
@@ -654,7 +662,7 @@ def row_add(request, schema, table):
             for column in definition.columns:
                 capability = capabilities.columns[column.name]
 
-                if not capability.can_insert:
+                if not capability.can_insert or column.name not in form.fields:
                     continue
 
                 value = form.cleaned_data[column.name]
@@ -778,6 +786,7 @@ def row_edit(
                 column.name: form.cleaned_data[column.name]
                 for column in definition.columns
                 if capabilities.columns[column.name].can_update
+                and column.name in form.fields
             }
 
             try:
@@ -835,6 +844,7 @@ def row_edit(
             column.name: current[column.name]
             for column in definition.columns
             if capabilities.columns[column.name].can_update
+            and column.name in form.fields
         }
 
         form = FormClass(initial=initial)

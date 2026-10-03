@@ -77,6 +77,7 @@ class LookupMapping(models.Model):
     target_value_column = models.CharField(max_length=63)
     display_columns = models.JSONField(default=list)
     search_columns = models.JSONField(default=list)
+    output_mappings = models.JSONField(default=list, blank=True)
     allow_null = models.BooleanField(default=False)
     allow_arbitrary_value = models.BooleanField(default=False)
 
@@ -112,6 +113,7 @@ LOOKUP_SEMANTIC_FIELDS = (
     "target_value_column",
     "display_columns",
     "search_columns",
+    "output_mappings",
     "allow_null",
     "allow_arbitrary_value",
 )

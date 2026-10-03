@@ -76,10 +76,21 @@ class EffectiveMetadataService:
         columns = {}
         configured_names = set(profiles)
         physical_names = {column.name for column in definition.columns}
+        mapped_targets = {}
+        for source_name, source_profile in profiles.items():
+            try:
+                mapping = source_profile.lookup_mapping
+            except LookupMapping.DoesNotExist:
+                continue
+            if isinstance(mapping.output_mappings, list):
+                for pair in mapping.output_mappings:
+                    if isinstance(pair, dict) and isinstance(pair.get("destination"), str):
+                        mapped_targets.setdefault(pair["destination"], []).append(source_name)
 
         for column in definition.columns:
             capability = physical.columns[column.name]
             column_profile = profiles.get(column.name)
+            mapped = column.name in mapped_targets
             lookup = None
             issues = []
 
@@ -94,7 +105,7 @@ class EffectiveMetadataService:
                 help_text = ""
             else:
                 label = column_profile.display_label or column.name
-                show_in_form = column_profile.show_in_form
+                show_in_form = column_profile.show_in_form and not mapped
                 editable = column_profile.editable
                 required = (
                     capability.required_on_insert
@@ -109,8 +120,14 @@ class EffectiveMetadataService:
                 if not column_profile.reviewed:
                     issues.append("Semantic metadata has not been reviewed.")
 
-                if editable and not show_in_form:
+                if editable and not show_in_form and not mapped:
                     issues.append("Editable columns must be shown on the form.")
+                if mapped and not editable:
+                    issues.append("Mapped columns must be editable.")
+                if mapped and input_mode == ColumnProfile.InputMode.LOOKUP:
+                    issues.append("Mapped columns cannot also be lookup inputs.")
+                if len(mapped_targets.get(column.name, [])) > 1:
+                    issues.append("Multiple lookups map to this column.")
 
                 if editable and not (
                     capability.can_insert or capability.can_update
@@ -128,7 +145,7 @@ class EffectiveMetadataService:
                     if lookup is None:
                         issues.append("Lookup mapping is not configured.")
                     else:
-                        issues.extend(self._validate_lookup(lookup))
+                        issues.extend(self._validate_lookup(lookup, definition))
                         required = required or not lookup.allow_null
                         allow_clear = allow_clear and lookup.allow_null
                         source_help = (
@@ -143,7 +160,7 @@ class EffectiveMetadataService:
                     issues.append("Lookup mapping requires lookup input mode.")
 
                 if required and not (
-                    capability.can_insert and editable and show_in_form
+                    capability.can_insert and editable and (show_in_form or mapped)
                 ):
                     issues.append(
                         "Required insert value cannot be entered on the form."
@@ -152,10 +169,10 @@ class EffectiveMetadataService:
             effective_capability = replace(
                 capability,
                 can_insert=(
-                    capability.can_insert and editable and show_in_form
+                    capability.can_insert and editable and (show_in_form or mapped)
                 ),
                 can_update=(
-                    capability.can_update and editable and show_in_form
+                    capability.can_update and editable and (show_in_form or mapped)
                 ),
                 required_on_insert=required,
                 warnings=capability.warnings + issues,
@@ -246,7 +263,7 @@ class EffectiveMetadataService:
             warnings=warnings,
         )
 
-    def _validate_lookup(self, lookup):
+    def _validate_lookup(self, lookup, destination):
         issues = []
         display_columns = lookup.display_columns
         search_columns = lookup.search_columns
@@ -278,6 +295,49 @@ class EffectiveMetadataService:
                 "Lookup target columns do not exist: "
                 + ", ".join(sorted(missing))
             )
+        mappings = lookup.output_mappings
+        if not isinstance(mappings, list):
+            issues.append("Lookup output mappings must be a list.")
+            return issues
+        if not mappings:
+            return issues
+        if lookup.target_value_column not in display_columns:
+            issues.append("Mapped lookup display must include its identity column.")
+        if lookup.allow_null or lookup.allow_arbitrary_value:
+            issues.append("Mapped lookup must require a selected source row.")
+        if target.primary_key != [lookup.target_value_column]:
+            issues.append("Mapped lookup value must be a single-column primary key.")
+        source_columns = {column.name: column for column in target.columns}
+        destination_columns = {column.name: column for column in destination.columns}
+        selector = destination_columns.get(lookup.column_profile.column_name)
+        source_key = source_columns.get(lookup.target_value_column)
+        if selector and source_key and selector.data_type != source_key.data_type:
+            issues.append("Lookup identity column types are incompatible.")
+        seen = {lookup.column_profile.column_name}
+        text_types = {"text", "character varying", "character"}
+        for pair in mappings:
+            if not isinstance(pair, dict) or set(pair) != {"source", "destination"}:
+                issues.append("Invalid lookup output mapping.")
+                continue
+            source_name, destination_name = pair["source"], pair["destination"]
+            if not isinstance(source_name, str) or not isinstance(destination_name, str):
+                issues.append("Invalid lookup output mapping.")
+                continue
+            if destination_name in seen:
+                issues.append("Lookup output destination is duplicated.")
+            seen.add(destination_name)
+            source_column = source_columns.get(source_name)
+            destination_column = destination_columns.get(destination_name)
+            if source_column is None or destination_column is None:
+                issues.append("Lookup output column does not exist.")
+                continue
+            if not (
+                source_column.data_type == destination_column.data_type
+                or {source_column.data_type, destination_column.data_type} <= text_types
+            ):
+                issues.append("Lookup output column types are incompatible.")
+            if destination_column.primary_key or destination_column.identity or destination_column.generated:
+                issues.append("Lookup output destination is database managed.")
         return issues
 
     @staticmethod

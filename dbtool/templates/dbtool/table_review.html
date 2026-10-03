@@ -70,6 +70,9 @@
       <div class="form-row">{{ form.search_columns.errors }}{{ form.search_columns.label_tag }} {{ form.search_columns }}</div>
       <div class="form-row">{{ form.allow_null.errors }}{{ form.allow_null }} {{ form.allow_null.label_tag }}</div>
       <div class="form-row">{{ form.allow_arbitrary_value.errors }}{{ form.allow_arbitrary_value }} {{ form.allow_arbitrary_value.label_tag }}</div>
+      {{ form.output_mappings.errors }}{{ form.output_mappings }}
+      <div class="form-row"><strong>Additional output mappings</strong> <button type="button" class="add-mapping">Add mapping</button></div>
+      <div class="output-mappings"></div>
     </div>
   </fieldset>
   {% endfor %}
@@ -78,8 +81,10 @@
 </form>
 
 {{ catalog|json_script:"lookup-catalog" }}
+{{ definition_columns|json_script:"destination-columns" }}
 <script>
 const catalog = JSON.parse(document.getElementById("lookup-catalog").textContent);
+const destinationColumns = JSON.parse(document.getElementById("destination-columns").textContent);
 
 function replaceOptions(select, values) {
   const selected = new Set([...select.selectedOptions].map((option) => option.value));
@@ -96,11 +101,45 @@ document.querySelectorAll(".column-review").forEach((section) => {
   const valueColumn = field("target_value_column");
   const displayColumns = field("display_columns");
   const searchColumns = field("search_columns");
+  const mappingInput = field("output_mappings");
+  const mappingRows = section.querySelector(".output-mappings");
+
+  function addMapping(source = "", destination = "") {
+    const row = document.createElement("div");
+    row.className = "form-row";
+    const sourceSelect = document.createElement("select");
+    const destinationSelect = document.createElement("select");
+    const remove = document.createElement("button");
+    remove.type = "button";
+    remove.textContent = "Remove";
+    sourceSelect.append(new Option("Source column", ""));
+    destinationSelect.append(new Option("Destination column", ""));
+    (catalog[schema.value]?.[table.value] || []).forEach((name) => sourceSelect.add(new Option(name, name)));
+    destinationColumns.forEach((name) => destinationSelect.add(new Option(name, name)));
+    sourceSelect.value = source;
+    destinationSelect.value = destination;
+    remove.addEventListener("click", () => row.remove());
+    row.append(sourceSelect, document.createTextNode(" → "), destinationSelect, remove);
+    mappingRows.append(row);
+  }
+  try {
+    JSON.parse(mappingInput.value || "[]").forEach(({source, destination}) => addMapping(source, destination));
+  } catch (_) { /* server displays invalid mapping error */ }
+  section.querySelector(".add-mapping").addEventListener("click", () => addMapping());
+  section.closest("form").addEventListener("submit", () => {
+    mappingInput.value = JSON.stringify([...mappingRows.children].map((row) => ({
+      source: row.children[0].value,
+      destination: row.children[1].value,
+    })));
+  });
 
   const toggleLookup = () => lookup.hidden = mode.value !== "lookup";
   const refreshColumns = () => {
     const columns = catalog[schema.value]?.[table.value] || [];
     [valueColumn, displayColumns, searchColumns].forEach((select) => replaceOptions(select, columns));
+    const existing = [...mappingRows.children].map((row) => row.children[1].value);
+    mappingRows.replaceChildren();
+    existing.forEach((destination) => addMapping("", destination));
   };
   const refreshTables = () => {
     replaceOptions(table, Object.keys(catalog[schema.value] || {}).sort());

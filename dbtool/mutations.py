@@ -28,6 +28,40 @@ class MutationService:
         self.metadata = EffectiveMetadataService(introspector=self.introspector)
         self.semantic_validator = SemanticValidator(self.repository)
 
+    def _apply_lookup_outputs(self, effective, values, before=None):
+        values = values.copy()
+        for name, column in effective.columns.items():
+            lookup = column.lookup
+            if lookup is None or not lookup.output_mappings:
+                continue
+            for pair in lookup.output_mappings:
+                values.pop(pair["destination"], None)
+            selected = values.get(name, before.get(name) if before else None)
+            if selected in (None, ""):
+                raise MutationNotAllowed(f"Select a valid value for {column.label}.")
+            if before is not None and selected == before.get(name):
+                continue
+            try:
+                source = self.repository.get_row(
+                    lookup.target_schema,
+                    lookup.target_table,
+                    {lookup.target_value_column: selected},
+                )
+            except Exception as exc:
+                raise MutationNotAllowed(
+                    f"Selected {column.label} could not be verified."
+                ) from exc
+            if source is None:
+                raise MutationNotAllowed(f"Selected {column.label} no longer exists.")
+            if source.get(lookup.target_value_column) != selected:
+                raise MutationNotAllowed(f"Selected {column.label} could not be verified.")
+            for pair in lookup.output_mappings:
+                value = source.get(pair["source"])
+                if value is None or value == "":
+                    raise MutationNotAllowed(f"Selected {column.label} has incomplete data.")
+                values[pair["destination"]] = value
+        return values
+
     def insert(
         self,
         *,
@@ -47,53 +81,38 @@ class MutationService:
         if not capabilities.can_insert:
             raise MutationNotAllowed("INSERT is not allowed for this table.")
 
-        allowed_columns = {
-            name
-            for name, capability in capabilities.columns.items()
-            if capability.can_insert
-        }
-
-        unknown_columns = set(values) - allowed_columns
-
-        if unknown_columns:
-            raise MutationNotAllowed(
-                "Attempted to write non-editable columns: "
-                + ", ".join(sorted(unknown_columns))
-            )
-
-        try:
-            self.semantic_validator.validate_insert(effective, values)
-        except SemanticValidationError as exc:
-            raise MutationNotAllowed(str(exc)) from exc
-
-        operation = OperationLog.objects.create(
-            schema_name=schema,
-            table_name=table,
-            action=OperationLog.Action.INSERT,
-            status=OperationLog.Status.PENDING,
-            actor=actor,
-        )
-
+        operation = None
         try:
             with transaction.atomic(using="target"):
-                after = self.repository.insert_row(
-                    schema,
-                    table,
-                    values,
+                values = self._apply_lookup_outputs(effective, values)
+                allowed_columns = {
+                    name for name, capability in capabilities.columns.items()
+                    if capability.can_insert
+                }
+                unknown_columns = set(values) - allowed_columns
+                if unknown_columns:
+                    raise MutationNotAllowed(
+                        "Attempted to write non-editable columns: "
+                        + ", ".join(sorted(unknown_columns))
+                    )
+                try:
+                    self.semantic_validator.validate_insert(effective, values)
+                except SemanticValidationError as exc:
+                    raise MutationNotAllowed(str(exc)) from exc
+
+                operation = OperationLog.objects.create(
+                    schema_name=schema,
+                    table_name=table,
+                    action=OperationLog.Action.INSERT,
+                    status=OperationLog.Status.PENDING,
+                    actor=actor,
                 )
-
+                after = self.repository.insert_row(schema, table, values)
         except Exception as exc:
-            operation.status = OperationLog.Status.FAILED
-
-            operation.error_message = str(exc)[:4000]
-
-            operation.save(
-                update_fields=[
-                    "status",
-                    "error_message",
-                ]
-            )
-
+            if operation is not None:
+                operation.status = OperationLog.Status.FAILED
+                operation.error_message = str(exc)[:4000]
+                operation.save(update_fields=["status", "error_message"])
             raise
 
         record_key = {
@@ -169,6 +188,8 @@ class MutationService:
                     raise StaleRowError(
                         "Row changed after the form was opened. Reload before updating."
                     )
+
+                values = self._apply_lookup_outputs(effective, values, before)
 
                 try:
                     self.semantic_validator.validate_update(

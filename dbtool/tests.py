@@ -1,3 +1,4 @@
+from contextlib import nullcontext
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
@@ -17,6 +18,9 @@ from dbtool.row_state import (
     row_fingerprint,
 )
 from dbtool.models import ColumnProfile, LookupMapping, TableProfile
+from dbtool.forms import ColumnReviewForm, build_row_form
+from dbtool.mutations import MutationNotAllowed, MutationService
+from audit.models import OperationLog
 from dbtool.semantic_validation import (
     SemanticValidationError,
     SemanticValidator,
@@ -1220,3 +1224,273 @@ class SemanticValidationTests(SemanticFixture, TestCase):
             "code",
             "NV002",
         )
+
+
+@override_settings(
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    }
+)
+class MultiOutputLookupTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.user = get_user_model().objects.create_user(
+            username="mapping-user", password="password", is_staff=True
+        )
+        def column(name, data_type, *, primary_key=False, identity=False):
+            return ColumnDefinition(
+                name=name, data_type=data_type, nullable=False, default=None,
+                primary_key=primary_key, identity=identity, generated=False,
+            )
+        cls.source = TableDefinition(
+            schema="public", name="hr_employee", table_type="BASE TABLE",
+            primary_key=["Id"],
+            columns=[
+                column("Id", "integer", primary_key=True, identity=True),
+                column("EmployeeID", "text"),
+                column("Name", "text"),
+            ],
+        )
+        cls.destination = TableDefinition(
+            schema="public", name="tracking", table_type="BASE TABLE",
+            primary_key=["Id"],
+            columns=[
+                column("Id", "integer", primary_key=True, identity=True),
+                column("EmployeeId", "integer"),
+                column("Code", "text"),
+                column("Name", "text"),
+            ],
+        )
+        profile = TableProfile.objects.create(
+            schema_name="public", table_name="tracking", mutation_enabled=True
+        )
+        for physical in cls.destination.columns:
+            editable = physical.name != "Id"
+            ColumnProfile.objects.create(
+                table_profile=profile, column_name=physical.name,
+                editable=editable, show_in_form=editable, reviewed=True,
+                required_on_insert=editable,
+                input_mode=(
+                    ColumnProfile.InputMode.LOOKUP
+                    if physical.name == "EmployeeId"
+                    else ColumnProfile.InputMode.TEXT
+                ),
+            )
+        selector = profile.column_profiles.get(column_name="EmployeeId")
+        LookupMapping.objects.create(
+            column_profile=selector, target_schema="public",
+            target_table="hr_employee", target_value_column="Id",
+            display_columns=["EmployeeID", "Name", "Id"],
+            search_columns=["Name", "EmployeeID"],
+            output_mappings=[
+                {"source": "EmployeeID", "destination": "Code"},
+                {"source": "Name", "destination": "Name"},
+            ],
+        )
+        TableProfile.objects.filter(pk=profile.pk).update(is_released=True)
+
+    def setUp(self):
+        self.introspector = StubIntrospector(self.destination, self.source)
+        self.effective = EffectiveMetadataService(
+            introspector=self.introspector
+        ).resolve(self.destination)
+        self.service = MutationService()
+        self.service.introspector = self.introspector
+        self.service.metadata = EffectiveMetadataService(
+            introspector=self.introspector
+        )
+        self.service.repository.introspector = self.introspector
+        self.service.repository.lookup_value_exists = lambda *args: True
+
+    def test_complete_release_and_form_only_asks_for_employee(self):
+        self.assertEqual(self.effective.configuration_status, COMPLETE)
+        self.assertTrue(self.effective.capabilities.can_insert)
+        FormClass = build_row_form(self.effective, mode="insert")
+        self.assertEqual(list(FormClass().fields), ["EmployeeId"])
+        bound = FormClass({"EmployeeId": "28", "Code": "FAKE"})
+        self.assertTrue(bound.is_valid())
+        self.assertEqual(bound.cleaned_data, {"EmployeeId": 28})
+
+    def test_insert_uses_selected_id_and_source_values_with_audit(self):
+        source = {"Id": 28, "EmployeeID": "0028", "Name": "Same Name"}
+        self.service.repository.get_row = lambda *args, **kwargs: source
+        self.service.repository.insert_row = lambda schema, table, values: {
+            "Id": 9, **values
+        }
+        with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+            after, operation = self.service.insert(
+                schema="public", table="tracking",
+                values={"EmployeeId": 28, "Code": "FAKE", "Name": "FAKE"},
+                actor=self.user,
+            )
+        self.assertEqual(
+            (after["EmployeeId"], after["Code"], after["Name"]),
+            (28, "0028", "Same Name"),
+        )
+        self.assertEqual(operation.status, OperationLog.Status.APPLIED)
+
+    def test_missing_or_incomplete_source_blocks_insert_without_audit(self):
+        for source in (
+            None,
+            {"Id": 28, "EmployeeID": None, "Name": "A"},
+            {"Id": 29, "EmployeeID": "029", "Name": "Wrong employee"},
+        ):
+            with self.subTest(source=source):
+                self.service.repository.get_row = lambda *args, **kwargs: source
+                with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+                    with self.assertRaises(MutationNotAllowed):
+                        self.service.insert(
+                            schema="public", table="tracking",
+                            values={"EmployeeId": 28}, actor=self.user,
+                        )
+        self.assertFalse(OperationLog.objects.exists())
+
+    def test_missing_source_on_changed_employee_blocks_update_without_audit(self):
+        before = {"Id": 9, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        self.service.repository.get_row = lambda schema, table, *args, **kwargs: (
+            before if table == "tracking" else None
+        )
+        with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+            with self.assertRaises(MutationNotAllowed):
+                self.service.update(
+                    schema="public", table="tracking", record_key={"Id": 9},
+                    values={"EmployeeId": 29},
+                    expected_fingerprint=row_fingerprint(before), actor=self.user,
+                )
+        self.assertFalse(OperationLog.objects.exists())
+
+    def test_unchanged_employee_keeps_existing_mapped_values_on_update(self):
+        before = {"Id": 9, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        self.service.repository.get_row = lambda *args, **kwargs: before
+        self.service.repository.update_row = lambda schema, table, key, values: {
+            **before, **values
+        }
+        with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+            after, _operation = self.service.update(
+                schema="public", table="tracking", record_key={"Id": 9},
+                values={"EmployeeId": 28, "Code": "FAKE"},
+                expected_fingerprint=row_fingerprint(before), actor=self.user,
+            )
+        self.assertEqual((after["Code"], after["Name"]), ("OLD", "Old"))
+
+    def test_changing_employee_updates_all_mapped_values(self):
+        before = {"Id": 9, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        source = {"Id": 29, "EmployeeID": "029", "Name": "New"}
+        self.service.repository.get_row = lambda schema, table, *args, **kwargs: (
+            before if table == "tracking" else source
+        )
+        self.service.repository.update_row = lambda schema, table, key, values: {
+            **before, **values
+        }
+        with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+            after, _operation = self.service.update(
+                schema="public", table="tracking", record_key={"Id": 9},
+                values={"EmployeeId": 29, "Code": "FAKE"},
+                expected_fingerprint=row_fingerprint(before), actor=self.user,
+            )
+        self.assertEqual(
+            (after["EmployeeId"], after["Code"], after["Name"]),
+            (29, "029", "New"),
+        )
+
+    def test_invalid_mapping_blocks_release_and_change_unreleases(self):
+        mapping = LookupMapping.objects.get(
+            column_profile__column_name="EmployeeId"
+        )
+        mapping.output_mappings = [
+            {"source": "Missing", "destination": "Code"}
+        ]
+        mapping.save(update_fields=["output_mappings"])
+        self.assertEqual(
+            EffectiveMetadataService(introspector=self.introspector)
+            .resolve(self.destination).configuration_status,
+            INCOMPLETE,
+        )
+        mapping.column_profile.table_profile.refresh_from_db()
+        self.assertFalse(mapping.column_profile.table_profile.is_released)
+
+    def test_review_form_rejects_unknown_output_columns(self):
+        catalog = {"public": {"hr_employee": ["Id", "EmployeeID", "Name"]}}
+        form = ColumnReviewForm(
+            {
+                "input_mode": "lookup", "target_schema": "public",
+                "target_table": "hr_employee", "target_value_column": "Id",
+                "display_columns": ["Name"], "search_columns": ["Name"],
+                "output_mappings": '[{"source":"Missing","destination":"Code"}]',
+            },
+            catalog=catalog,
+            destination_columns=["EmployeeId", "Code", "Name"],
+        )
+        self.assertFalse(form.is_valid())
+        self.assertIn("output_mappings", form.errors)
+
+    def test_review_page_saves_mapping_and_actual_change_unreleases(self):
+        root = get_user_model().objects.create_superuser(
+            username="mapping-root", password="password"
+        )
+        self.client.force_login(root)
+        url = reverse(
+            "dbtool:table_review",
+            kwargs={"schema": "public", "table": "tracking"},
+        )
+        data = {"table-display_label": "Tracking", "table-mutation_enabled": "on"}
+        for index, name in enumerate(("Id", "EmployeeId", "Code", "Name")):
+            prefix = f"column-{index}-"
+            data[prefix + "reviewed"] = "on"
+            data[prefix + "input_mode"] = "lookup" if name == "EmployeeId" else "text"
+            if name != "Id":
+                data[prefix + "show_in_form"] = "on"
+                data[prefix + "editable"] = "on"
+                data[prefix + "required_on_insert"] = "on"
+        data.update({
+            "column-1-target_schema": "public",
+            "column-1-target_table": "hr_employee",
+            "column-1-target_value_column": "Id",
+            "column-1-display_columns": ["EmployeeID", "Name", "Id"],
+            "column-1-search_columns": ["Name", "EmployeeID"],
+            "column-1-output_mappings": '[{"source":"Name","destination":"Code"}]',
+        })
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            response = self.client.post(url, data)
+        self.assertEqual(response.status_code, 302)
+        lookup = LookupMapping.objects.get(column_profile__column_name="EmployeeId")
+        self.assertEqual(
+            lookup.output_mappings,
+            [{"source": "Name", "destination": "Code"}],
+        )
+        lookup.column_profile.table_profile.refresh_from_db()
+        self.assertFalse(lookup.column_profile.table_profile.is_released)
+
+    def test_released_form_requires_employee_selection(self):
+        self.client.force_login(self.user)
+        with (
+            patch("dbtool.views.SchemaIntrospector", return_value=self.introspector),
+            patch("dbtool.forms.GenericTableRepository") as repository_class,
+            patch("dbtool.views.MutationService") as mutation_class,
+        ):
+            repository_class.return_value.search_lookup_rows.return_value = []
+            response = self.client.post(
+                reverse(
+                    "dbtool:row_add",
+                    kwargs={"schema": "public", "table": "tracking"},
+                ),
+                {},
+            )
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("EmployeeId", response.context["form"].errors)
+        mutation_class.assert_not_called()
+
+    def test_stale_edit_does_not_read_source_or_mutate(self):
+        before = {"Id": 9, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        with patch.object(self.service.repository, "get_row", return_value=before) as get_row:
+            with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+                from dbtool.mutations import StaleRowError
+                with self.assertRaises(StaleRowError):
+                    self.service.update(
+                        schema="public", table="tracking", record_key={"Id": 9},
+                        values={"EmployeeId": 29},
+                        expected_fingerprint="stale", actor=self.user,
+                    )
+        get_row.assert_called_once()
+        self.assertFalse(OperationLog.objects.exists())

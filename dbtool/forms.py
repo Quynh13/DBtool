@@ -35,9 +35,12 @@ class ColumnReviewForm(forms.Form):
     search_columns = forms.MultipleChoiceField(required=False)
     allow_null = forms.BooleanField(required=False)
     allow_arbitrary_value = forms.BooleanField(required=False)
+    output_mappings = forms.JSONField(required=False, widget=forms.HiddenInput)
 
-    def __init__(self, *args, catalog, **kwargs):
+    def __init__(self, *args, catalog, destination_columns=(), **kwargs):
         super().__init__(*args, **kwargs)
+        self.catalog = catalog
+        self.destination_columns = set(destination_columns)
         schemas = sorted(catalog)
         selected_schema = self._selected("target_schema")
         if selected_schema not in catalog:
@@ -67,6 +70,7 @@ class ColumnReviewForm(forms.Form):
     def clean(self):
         cleaned = super().clean()
         if cleaned.get("input_mode") != ColumnProfile.InputMode.LOOKUP:
+            cleaned["output_mappings"] = []
             return cleaned
 
         for name in (
@@ -78,6 +82,19 @@ class ColumnReviewForm(forms.Form):
         ):
             if not cleaned.get(name):
                 self.add_error(name, "Required for lookup input mode.")
+        mappings = cleaned.get("output_mappings") or []
+        cleaned["output_mappings"] = mappings
+        source_names = set(self.catalog.get(cleaned.get("target_schema"), {}).get(cleaned.get("target_table"), []))
+        if not isinstance(mappings, list) or any(
+            not isinstance(pair, dict)
+            or set(pair) != {"source", "destination"}
+            or not isinstance(pair["source"], str)
+            or not isinstance(pair["destination"], str)
+            or pair["source"] not in source_names
+            or pair["destination"] not in self.destination_columns
+            for pair in mappings
+        ):
+            self.add_error("output_mappings", "Choose valid source and destination columns.")
         return cleaned
 
 
@@ -211,6 +228,9 @@ def build_row_form(
     for column in effective.definition.columns:
         effective_column = effective.columns[column.name]
         capability = effective.capabilities.columns[column.name]
+
+        if not effective_column.show_in_form:
+            continue
 
         if mode == "insert":
             if not capability.can_insert:
