@@ -8,6 +8,10 @@ The current Django application keeps running unchanged. The local Tool DB
 snapshot is `local-test/baseline-2026-10-04/db.sqlite3`; the development copy
 is `local-test/frontend-debug/db.sqlite3`. Both are ignored by Git. The
 snapshot is local only and is **not** a backup of a Docker volume or Target DB.
+The running server's Docker image is older (it has no `dbtool` migrations).
+Its Tool DB was backed up separately at
+`local-test/legacy-container-2026-10-04/db.sqlite3`; do not restore that
+older database over the Django MVP snapshot.
 
 1. Copy `frontend-debug.env.example` to `.env.frontend-debug` and supply a
    **dedicated test Target DB**. Do not copy credentials into tracked files.
