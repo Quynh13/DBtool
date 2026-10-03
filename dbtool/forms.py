@@ -1,7 +1,6 @@
 from django import forms
 
 from dbtool.models import ColumnProfile
-from dbtool.repository import GenericTableRepository
 
 
 class TableReviewForm(forms.Form):
@@ -274,26 +273,13 @@ def build_row_form(
 
 def populate_lookup_choices(form, effective, initial_values=None):
     initial_values = initial_values or {}
-    repository = GenericTableRepository()
 
     for name, effective_column in effective.columns.items():
         if name not in form.fields or effective_column.lookup is None:
             continue
         lookup = effective_column.lookup
         choices = [("", f"Search {effective_column.label}...")]
-        choices.extend(
-            (item["value"], item["label"])
-            for item in repository.search_lookup_rows(
-                lookup.target_schema,
-                lookup.target_table,
-                value_column=lookup.target_value_column,
-                display_columns=lookup.display_columns,
-                search_columns=lookup.search_columns,
-            )
-        )
         current = initial_values.get(name)
-        if current not in (None, "") and str(current) not in {
-            value for value, _label in choices
-        }:
+        if current not in (None, ""):
             choices.append((str(current), str(current)))
         form.fields[name].widget.choices = choices

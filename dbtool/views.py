@@ -49,7 +49,10 @@ from django.shortcuts import get_object_or_404
 from django.urls import reverse
 from django.views.decorators.http import require_POST
 
-from audit.models import OperationLog
+from audit.models import OperationLog, ToolOwnedRecord
+from audit.codec import decode_row
+from dbtool.ownership import key_digest, owned_record, verified_owned_record
+from dbtool.row_state import row_fingerprint
 from dbtool.rollback import (
     RollbackNotAllowed,
     RollbackService,
@@ -168,13 +171,7 @@ def _form_sections(form, effective, mode):
 
 
 def _metadata_catalog(introspector):
-    catalog = {}
-    for schema, table, _table_type in introspector.list_tables():
-        definition = introspector.inspect_table(schema, table)
-        catalog.setdefault(schema, {})[table] = [
-            column.name for column in definition.columns
-        ]
-    return catalog
+    return introspector.column_catalog()
 
 
 def _column_review_initial(column, profile, capability):
@@ -225,11 +222,13 @@ def table_list(request):
 
     tables = []
 
-    for schema, table_name, table_type in introspector.list_tables():
-        definition = introspector.inspect_table(
-            schema,
-            table_name,
-        )
+    for profile in TableProfile.objects.filter(is_released=True):
+        schema, table_name = profile.schema_name, profile.table_name
+        try:
+            definition = introspector.inspect_table(schema, table_name)
+        except ValueError:
+            continue
+        table_type = definition.table_type
 
         effective = metadata.resolve(definition)
 
@@ -279,8 +278,8 @@ def database_configuration(request):
     }
     tables = []
 
-    for schema, table_name, _table_type in introspector.list_tables():
-        definition = introspector.inspect_table(schema, table_name)
+    for definition in introspector.list_definitions():
+        schema, table_name = definition.schema, definition.name
         effective = metadata.resolve(definition)
         released = bool(effective.profile and effective.profile.is_released)
         tables.append(
@@ -384,10 +383,10 @@ def table_detail(request, schema, table):
 
     page = max(page, 1)
 
-    total_rows = repository.count_rows(
-        schema,
-        table,
-    )
+    owned = ToolOwnedRecord.objects.filter(
+        schema_name=schema, table_name=table, active=True
+    ).order_by("pk")
+    total_rows = owned.count()
 
     total_pages = max(
         math.ceil(total_rows / PAGE_SIZE),
@@ -399,12 +398,18 @@ def table_detail(request, schema, table):
 
     offset = (page - 1) * PAGE_SIZE
 
-    raw_rows = repository.list_rows(
-        schema,
-        table,
-        limit=PAGE_SIZE,
-        offset=offset,
+    owned_page = list(owned[offset:offset + PAGE_SIZE])
+    raw_rows = repository.rows_by_keys(
+        definition, [decode_row(item.record_key) for item in owned_page]
     )
+    fingerprints = {
+        item.key_digest: item.fingerprint for item in owned_page
+    }
+    raw_rows = [
+        row for row in raw_rows
+        if fingerprints.get(key_digest({name: row[name] for name in definition.primary_key}))
+        == row_fingerprint(row)
+    ]
 
     rows = []
 
@@ -821,6 +826,9 @@ def row_edit(
 
     record_key = _load_record_key(row_token)
 
+    if owned_record(schema, table, record_key) is None:
+        raise Http404("Row is not managed by this tool.")
+
     current = repository.get_row(
         schema,
         table,
@@ -829,6 +837,8 @@ def row_edit(
 
     if current is None:
         raise Http404("Row does not exist.")
+    if verified_owned_record(schema, table, record_key, current) is None:
+        raise Http404("Row is not managed by this tool.")
 
     FormClass = build_row_form(
         effective,
@@ -912,6 +922,7 @@ def row_edit(
         )
 
     else:
+        form = FormClass()
         initial = {
             column.name: current[column.name]
             for column in definition.columns
@@ -969,6 +980,9 @@ def row_delete(
 
     record_key = _load_record_key(row_token)
 
+    if owned_record(schema, table, record_key) is None:
+        raise Http404("Row is not managed by this tool.")
+
     current = repository.get_row(
         schema,
         table,
@@ -977,6 +991,8 @@ def row_delete(
 
     if current is None:
         raise Http404("Row does not exist.")
+    if verified_owned_record(schema, table, record_key, current) is None:
+        raise Http404("Row is not managed by this tool.")
 
     if request.method == "POST":
         try:

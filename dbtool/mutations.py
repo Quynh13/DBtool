@@ -1,9 +1,10 @@
 from django.db import transaction
 
 from audit.codec import encode_row
-from audit.models import OperationLog
+from audit.models import OperationLog, ToolOwnedRecord
 from dbtool.introspection import SchemaIntrospector
 from dbtool.repository import GenericTableRepository
+from dbtool.ownership import key_digest, owned_record
 from dbtool.row_state import row_fingerprint
 from dbtool.semantic_validation import SemanticValidationError, SemanticValidator
 from dbtool.semantics import EffectiveMetadataService
@@ -108,6 +109,13 @@ class MutationService:
                     actor=actor,
                 )
                 after = self.repository.insert_row(schema, table, values)
+                record_key = {
+                    column_name: after[column_name] for column_name in definition.primary_key
+                }
+                # Persist recovery evidence before the Target transaction commits.
+                operation.record_key = encode_row(record_key)
+                operation.after_data = encode_row(after)
+                operation.save(update_fields=["record_key", "after_data"])
         except Exception as exc:
             if operation is not None:
                 operation.status = OperationLog.Status.FAILED
@@ -115,23 +123,29 @@ class MutationService:
                 operation.save(update_fields=["status", "error_message"])
             raise
 
-        record_key = {
-            column_name: after[column_name] for column_name in definition.primary_key
-        }
-
-        operation.record_key = encode_row(record_key)
-
-        operation.after_data = encode_row(after)
-
-        operation.status = OperationLog.Status.APPLIED
-
-        operation.save(
-            update_fields=[
-                "record_key",
-                "after_data",
-                "status",
-            ]
-        )
+        from dbtool.row_state import row_fingerprint
+        with transaction.atomic():
+            existing = ToolOwnedRecord.objects.filter(
+                schema_name=schema, table_name=table, key_digest=key_digest(record_key)
+            ).first()
+            if existing is not None and existing.active:
+                raise MutationNotAllowed("Record key is already registered to this tool.")
+            if existing is None:
+                ToolOwnedRecord.objects.create(
+                    schema_name=schema, table_name=table,
+                    key_digest=key_digest(record_key), record_key=encode_row(record_key),
+                    fingerprint=row_fingerprint(after), origin=operation,
+                    last_operation=operation,
+                )
+            else:
+                existing.record_key = encode_row(record_key)
+                existing.fingerprint = row_fingerprint(after)
+                existing.origin = operation
+                existing.last_operation = operation
+                existing.active = True
+                existing.save(update_fields=["record_key", "fingerprint", "origin", "last_operation", "active"])
+            operation.status = OperationLog.Status.APPLIED
+            operation.save(update_fields=["status"])
 
         return after, operation
 
@@ -155,6 +169,10 @@ class MutationService:
 
         if not capabilities.can_update:
             raise MutationNotAllowed("UPDATE is not allowed for this table.")
+
+        owned = owned_record(schema, table, record_key)
+        if owned is None:
+            raise MutationNotAllowed("Only rows created by this tool may be updated.")
 
         allowed_columns = {
             name
@@ -183,6 +201,9 @@ class MutationService:
 
                 if before is None:
                     raise RowNotFound("Row no longer exists.")
+
+                if row_fingerprint(before) != owned.fingerprint:
+                    raise StaleRowError("Owned row changed outside the tool.")
 
                 if row_fingerprint(before) != expected_fingerprint:
                     raise StaleRowError(
@@ -220,6 +241,9 @@ class MutationService:
                 if after is None:
                     raise RowNotFound("Row disappeared during UPDATE.")
 
+                operation.after_data = encode_row(after)
+                operation.save(update_fields=["after_data"])
+
         except (
             RowNotFound,
             StaleRowError,
@@ -241,16 +265,12 @@ class MutationService:
 
             raise
 
-        operation.after_data = encode_row(after)
-
-        operation.status = OperationLog.Status.APPLIED
-
-        operation.save(
-            update_fields=[
-                "after_data",
-                "status",
-            ]
-        )
+        with transaction.atomic():
+            owned.fingerprint = row_fingerprint(after)
+            owned.last_operation = operation
+            owned.save(update_fields=["fingerprint", "last_operation"])
+            operation.status = OperationLog.Status.APPLIED
+            operation.save(update_fields=["status"])
 
         return after, operation
 
@@ -274,6 +294,10 @@ class MutationService:
         if not capabilities.can_delete:
             raise MutationNotAllowed("DELETE is not allowed for this table.")
 
+        owned = owned_record(schema, table, record_key)
+        if owned is None:
+            raise MutationNotAllowed("Only rows created by this tool may be deleted.")
+
         operation = None
 
         try:
@@ -287,6 +311,9 @@ class MutationService:
 
                 if before is None:
                     raise RowNotFound("Row no longer exists.")
+
+                if row_fingerprint(before) != owned.fingerprint:
+                    raise StaleRowError("Owned row changed outside the tool.")
 
                 if row_fingerprint(before) != expected_fingerprint:
                     raise StaleRowError(
@@ -334,12 +361,11 @@ class MutationService:
 
             raise
 
-        operation.status = OperationLog.Status.APPLIED
-
-        operation.save(
-            update_fields=[
-                "status",
-            ]
-        )
+        with transaction.atomic():
+            owned.active = False
+            owned.last_operation = operation
+            owned.save(update_fields=["active", "last_operation"])
+            operation.status = OperationLog.Status.APPLIED
+            operation.save(update_fields=["status"])
 
         return deleted, operation

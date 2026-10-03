@@ -20,7 +20,10 @@ from dbtool.row_state import (
 from dbtool.models import ColumnProfile, ConfigurationEvent, LookupMapping, TableProfile
 from dbtool.forms import ColumnReviewForm, build_row_form
 from dbtool.mutations import MutationNotAllowed, MutationService
-from audit.models import OperationLog
+from audit.codec import encode_row
+from audit.models import OperationLog, ToolOwnedRecord
+from dbtool.ownership import key_digest
+from dbtool.rollback import RollbackNotAllowed, RollbackService
 from dbtool.semantic_validation import (
     SemanticValidationError,
     SemanticValidator,
@@ -329,6 +332,17 @@ class StubIntrospector:
             (definition.schema, definition.name, definition.table_type)
             for definition in self.definitions.values()
         ]
+
+    def list_definitions(self):
+        return list(self.definitions.values())
+
+    def column_catalog(self):
+        catalog = {}
+        for definition in self.definitions.values():
+            catalog.setdefault(definition.schema, {})[definition.name] = [
+                column.name for column in definition.columns
+            ]
+        return catalog
 
 
 class SemanticFixture:
@@ -1368,6 +1382,20 @@ class MultiOutputLookupTests(TestCase):
         self.service.repository.introspector = self.introspector
         self.service.repository.lookup_value_exists = lambda *args: True
 
+    def own(self, row):
+        key = {"Id": row["Id"]}
+        origin = OperationLog.objects.create(
+            schema_name="public", table_name="tracking",
+            action=OperationLog.Action.INSERT,
+            status=OperationLog.Status.APPLIED,
+            record_key=encode_row(key), after_data=encode_row(row), actor=self.user,
+        )
+        ToolOwnedRecord.objects.create(
+            schema_name="public", table_name="tracking", key_digest=key_digest(key),
+            record_key=encode_row(key), fingerprint=row_fingerprint(row),
+            origin=origin, last_operation=origin,
+        )
+
     def test_complete_release_and_form_only_asks_for_employee(self):
         self.assertEqual(self.effective.configuration_status, COMPLETE)
         self.assertTrue(self.effective.capabilities.can_insert)
@@ -1427,6 +1455,7 @@ class MultiOutputLookupTests(TestCase):
 
     def test_unchanged_employee_keeps_existing_mapped_values_on_update(self):
         before = {"Id": 9, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        self.own(before)
         self.service.repository.get_row = lambda *args, **kwargs: before
         self.service.repository.update_row = lambda schema, table, key, values: {
             **before, **values
@@ -1441,6 +1470,7 @@ class MultiOutputLookupTests(TestCase):
 
     def test_changing_employee_updates_all_mapped_values(self):
         before = {"Id": 9, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        self.own(before)
         source = {"Id": 29, "EmployeeID": "029", "Name": "New"}
         self.service.repository.get_row = lambda schema, table, *args, **kwargs: (
             before if table == "tracking" else source
@@ -1531,10 +1561,8 @@ class MultiOutputLookupTests(TestCase):
         self.client.force_login(self.user)
         with (
             patch("dbtool.views.SchemaIntrospector", return_value=self.introspector),
-            patch("dbtool.forms.GenericTableRepository") as repository_class,
             patch("dbtool.views.MutationService") as mutation_class,
         ):
-            repository_class.return_value.search_lookup_rows.return_value = []
             response = self.client.post(
                 reverse(
                     "dbtool:row_add",
@@ -1548,6 +1576,7 @@ class MultiOutputLookupTests(TestCase):
 
     def test_stale_edit_does_not_read_source_or_mutate(self):
         before = {"Id": 9, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        self.own(before)
         with patch.object(self.service.repository, "get_row", return_value=before) as get_row:
             with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
                 from dbtool.mutations import StaleRowError
@@ -1558,4 +1587,102 @@ class MultiOutputLookupTests(TestCase):
                         expected_fingerprint="stale", actor=self.user,
                     )
         get_row.assert_called_once()
-        self.assertFalse(OperationLog.objects.exists())
+        self.assertEqual(OperationLog.objects.count(), 1)
+
+    def test_legacy_row_cannot_be_updated_or_deleted_by_service(self):
+        before = {"Id": 90, "EmployeeId": 28, "Code": "OLD", "Name": "Old"}
+        with patch.object(self.service.repository, "get_row") as get_row:
+            for action in (self.service.update, self.service.delete):
+                with self.assertRaises(MutationNotAllowed):
+                    action(schema="public", table="tracking", record_key={"Id": 90},
+                           expected_fingerprint=row_fingerprint(before), actor=self.user,
+                           **({"values": {"EmployeeId": 29}} if action == self.service.update else {}))
+            get_row.assert_not_called()
+
+    def test_legacy_row_direct_edit_and_delete_urls_are_hidden(self):
+        self.client.force_login(self.user)
+        token = make_row_token({"Id": 90})
+        with (patch("dbtool.views.SchemaIntrospector", return_value=self.introspector),
+              patch("dbtool.views.GenericTableRepository") as repository):
+            for action in ("row_edit", "row_delete"):
+                response = self.client.get(reverse(
+                    f"dbtool:{action}", kwargs={"schema": "public", "table": "tracking", "row_token": token}
+                ))
+                self.assertEqual(response.status_code, 404)
+            repository.return_value.get_row.assert_not_called()
+
+    def test_owned_edit_page_opens_without_loading_lookup_rows(self):
+        row = {"Id": 9, "EmployeeId": 28, "Code": "OWNED", "Name": "Own"}
+        self.own(row)
+        self.client.force_login(self.user)
+        with (patch("dbtool.views.SchemaIntrospector", return_value=self.introspector),
+              patch("dbtool.views.GenericTableRepository") as repository):
+            repository.return_value.get_row.return_value = row
+            response = self.client.get(reverse(
+                "dbtool:row_edit", kwargs={"schema": "public", "table": "tracking",
+                                              "row_token": make_row_token({"Id": 9})}
+            ))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.context["form"].initial["EmployeeId"], 28)
+            repository.return_value.search_lookup_rows.assert_not_called()
+
+    def test_detail_lists_only_tool_owned_rows(self):
+        self.client.force_login(self.user)
+        row = {"Id": 9, "EmployeeId": 28, "Code": "OWNED", "Name": "Own"}
+        self.own(row)
+        with (patch("dbtool.views.SchemaIntrospector", return_value=self.introspector),
+              patch("dbtool.views.GenericTableRepository") as repository):
+            repository.return_value.rows_by_keys.return_value = [row]
+            response = self.client.get(reverse(
+                "dbtool:table_detail", kwargs={"schema": "public", "table": "tracking"}
+            ))
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(response.context["total_rows"], 1)
+            repository.return_value.rows_by_keys.assert_called_once_with(self.destination, [{"Id": 9}])
+            repository.return_value.list_rows.assert_not_called()
+            repository.return_value.count_rows.assert_not_called()
+
+    def test_insert_rollback_deactivates_owned_record(self):
+        row = {"Id": 9, "EmployeeId": 28, "Code": "OWNED", "Name": "Own"}
+        self.own(row)
+        operation = OperationLog.objects.get(action=OperationLog.Action.INSERT)
+        service = RollbackService()
+        service.repository.get_row = lambda *args, **kwargs: row
+        service.repository.delete_row = lambda *args, **kwargs: row
+        with patch("dbtool.rollback.transaction.atomic", return_value=nullcontext()):
+            service.rollback(operation)
+        self.assertFalse(ToolOwnedRecord.objects.get(origin=operation).active)
+        operation.refresh_from_db()
+        self.assertEqual(operation.status, OperationLog.Status.ROLLED_BACK)
+
+    def test_owned_delete_and_rollback_restore_visibility(self):
+        row = {"Id": 9, "EmployeeId": 28, "Code": "OWNED", "Name": "Own"}
+        self.own(row)
+        self.service.repository.get_row = lambda *args, **kwargs: row
+        self.service.repository.delete_row = lambda *args, **kwargs: row
+        with patch("dbtool.mutations.transaction.atomic", return_value=nullcontext()):
+            _deleted, operation = self.service.delete(
+                schema="public", table="tracking", record_key={"Id": 9},
+                expected_fingerprint=row_fingerprint(row), actor=self.user,
+            )
+        owned = ToolOwnedRecord.objects.get(schema_name="public", table_name="tracking")
+        self.assertFalse(owned.active)
+        self.assertEqual(owned.last_operation_id, operation.id)
+        rollback = RollbackService()
+        rollback.repository.get_row = lambda *args, **kwargs: None
+        rollback.repository.restore_deleted_row = lambda *args, **kwargs: row
+        with patch("dbtool.rollback.transaction.atomic", return_value=nullcontext()):
+            rollback.rollback(operation)
+        owned.refresh_from_db()
+        self.assertTrue(owned.active)
+
+    def test_legacy_operation_cannot_rollback(self):
+        operation = OperationLog.objects.create(
+            schema_name="public", table_name="tracking",
+            action=OperationLog.Action.INSERT, status=OperationLog.Status.APPLIED,
+            record_key=encode_row({"Id": 90}), actor=self.user,
+        )
+        with self.assertRaises(RollbackNotAllowed):
+            RollbackService().rollback(operation)
+        operation.refresh_from_db()
+        self.assertEqual(operation.status, OperationLog.Status.APPLIED)

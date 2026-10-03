@@ -82,6 +82,26 @@ class GenericTableRepository:
 
         return rows
 
+    def rows_by_keys(self, definition, keys):
+        if not keys:
+            return []
+        for key in keys:
+            self._validate_record_key(definition, key)
+        connection = connections[self.database_alias]
+        quote = connection.ops.quote_name
+        where = " OR ".join(
+            "(" + " AND ".join(f"{quote(name)} = %s" for name in definition.primary_key) + ")"
+            for _ in keys
+        )
+        params = [key[name] for key in keys for name in definition.primary_key]
+        with connection.cursor() as cursor:
+            cursor.execute(
+                f"SELECT * FROM {quote(definition.schema)}.{quote(definition.name)} WHERE {where}",
+                params,
+            )
+            names = [item[0] for item in cursor.description]
+            return [dict(zip(names, row)) for row in cursor.fetchall()]
+
     def count_rows(
         self,
         schema: str,

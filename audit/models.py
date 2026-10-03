@@ -78,3 +78,25 @@ class OperationLog(models.Model):
 
     def __str__(self):
         return f"{self.action} {self.schema_name}.{self.table_name} {self.id}"
+
+
+class ToolOwnedRecord(models.Model):
+    schema_name = models.CharField(max_length=255)
+    table_name = models.CharField(max_length=255)
+    key_digest = models.CharField(max_length=64)
+    record_key = models.JSONField()
+    fingerprint = models.CharField(max_length=64)
+    active = models.BooleanField(default=True)
+    origin = models.ForeignKey(OperationLog, on_delete=models.PROTECT)
+    last_operation = models.ForeignKey(
+        OperationLog, on_delete=models.PROTECT, related_name="owned_record_states",
+        null=True,
+    )
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(
+                fields=["schema_name", "table_name", "key_digest"],
+                name="unique_tool_owned_record",
+            )
+        ]

@@ -5,7 +5,9 @@ from audit.codec import (
     decode_row,
     encode_row,
 )
-from audit.models import OperationLog
+from audit.models import OperationLog, ToolOwnedRecord
+from dbtool.ownership import key_digest, owned_record
+from dbtool.row_state import row_fingerprint
 from dbtool.repository import GenericTableRepository
 
 
@@ -40,6 +42,22 @@ class RollbackService:
                 "This operation cannot be rolled back "
                 f"from status '{operation.status}'."
             )
+
+        record_key = decode_row(operation.record_key)
+        owned = owned_record(operation.schema_name, operation.table_name, record_key) if record_key else None
+        if operation.action == OperationLog.Action.DELETE:
+            owned = ToolOwnedRecord.objects.filter(
+                schema_name=operation.schema_name,
+                table_name=operation.table_name,
+                key_digest=key_digest(record_key),
+                active=False,
+            ).first()
+        if owned is None or owned.origin.action != OperationLog.Action.INSERT:
+            raise RollbackNotAllowed("Only rows created by this tool may be rolled back.")
+        if owned.last_operation_id != operation.id:
+            raise RollbackNotAllowed("A later operation changed this record.")
+        if operation.action == OperationLog.Action.INSERT and owned.origin_id != operation.id:
+            raise RollbackNotAllowed("This INSERT no longer owns the current record.")
 
         operation.status = OperationLog.Status.ROLLBACK_PENDING
 
@@ -85,13 +103,21 @@ class RollbackService:
 
         operation.error_message = ""
 
-        operation.save(
-            update_fields=[
-                "status",
-                "rolled_back_at",
-                "error_message",
-            ]
-        )
+        with transaction.atomic():
+            if operation.action == OperationLog.Action.INSERT:
+                owned.active = False
+                owned.last_operation = operation
+                owned.save(update_fields=["active", "last_operation"])
+            elif operation.action == OperationLog.Action.DELETE:
+                owned.active = True
+                owned.fingerprint = row_fingerprint(decode_row(operation.before_data))
+                owned.last_operation = operation
+                owned.save(update_fields=["active", "fingerprint", "last_operation"])
+            elif operation.action == OperationLog.Action.UPDATE:
+                owned.fingerprint = row_fingerprint(decode_row(operation.before_data))
+                owned.last_operation = operation
+                owned.save(update_fields=["fingerprint", "last_operation"])
+            operation.save(update_fields=["status", "rolled_back_at", "error_message"])
 
     def _rollback_insert(
         self,
@@ -114,6 +140,10 @@ class RollbackService:
 
             if current is None:
                 raise RollbackConflict("Inserted row no longer exists.")
+
+            owned = owned_record(operation.schema_name, operation.table_name, record_key)
+            if owned is None or owned.fingerprint != row_fingerprint(current):
+                raise RollbackConflict("Owned row changed since the operation.")
 
             if not _rows_equal(
                 current,
@@ -155,6 +185,10 @@ class RollbackService:
 
             if current is None:
                 raise RollbackConflict("Updated row no longer exists.")
+
+            owned = owned_record(operation.schema_name, operation.table_name, record_key)
+            if owned is None or owned.fingerprint != row_fingerprint(current):
+                raise RollbackConflict("Owned row changed since the operation.")
 
             if not _rows_equal(
                 current,
