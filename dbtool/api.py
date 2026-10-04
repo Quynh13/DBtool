@@ -10,13 +10,14 @@ from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
 from audit.models import OperationLog
+from audit.codec import decode_row, decode_value, encode_row
 from dbtool.forms import build_row_form
 from dbtool.introspection import SchemaIntrospector
 from dbtool.models import ColumnProfile, ConfigurationEvent
 from dbtool.mutations import MutationService, RowNotFound, StaleRowError
 from dbtool.ownership import owned_record, verified_owned_record
 from dbtool.repository import GenericTableRepository
-from dbtool.row_state import load_row_token, load_state_token, make_state_token
+from dbtool.row_state import load_row_token, load_state_token, make_row_token, make_state_token
 from dbtool.rollback import RollbackService
 from dbtool.semantics import EffectiveMetadataService
 from dbtool.views import (
@@ -197,6 +198,51 @@ def _owned_row(schema, table, row_token):
     return record_key, row
 
 
+@require_GET
+@staff_required
+def row_detail(request, schema, table, row_token):
+    definition, effective = _table(request, schema, table)
+    if definition is None:
+        return JsonResponse({"error": "Table not found."}, status=404)
+    if effective is None:
+        return JsonResponse({"error": "Table is not released."}, status=403)
+    record_key, current = _owned_row(schema, table, row_token)
+    if current is None:
+        return JsonResponse({"error": "Managed row not found."}, status=404)
+    result = {
+        "values": {name: _display_value(value) for name, value in current.items()},
+        "can_update": effective.capabilities.can_update,
+        "can_delete": effective.capabilities.can_delete,
+    }
+    if request.user.is_superuser:
+        owner = owned_record(schema, table, record_key)
+        operations = OperationLog.objects.filter(
+            schema_name=schema, table_name=table, record_key=encode_row(record_key),
+            created_at__gte=owner.origin.created_at,
+        ).select_related("actor").order_by("created_at", "pk")
+        result["history"] = [
+            {
+                "id": str(item.pk),
+                "action": item.action,
+                "status": item.status,
+                "created_at": item.created_at,
+                "actor": item.actor.get_username() if item.actor else None,
+                "changes": [
+                    {
+                        "column": name,
+                        "before": _display_value(decode_value(before[name])) if name in before else "—",
+                        "after": _display_value(decode_value(after[name])) if name in after else "—",
+                    }
+                    for name in sorted(before.keys() | after.keys())
+                    if before.get(name) != after.get(name)
+                ],
+            }
+            for item in operations
+            for before, after in [(item.before_data or {}, item.after_data or {})]
+        ]
+    return JsonResponse(result)
+
+
 @require_http_methods(["GET", "POST"])
 @staff_required
 def row_edit(request, schema, table, row_token):
@@ -368,6 +414,16 @@ def operation_detail(request, operation_id):
         item = OperationLog.objects.select_related("actor").get(pk=operation_id)
     except OperationLog.DoesNotExist:
         return JsonResponse({"error": "Operation not found."}, status=404)
+    record_key = decode_row(item.record_key) if item.record_key else None
+    owner = owned_record(item.schema_name, item.table_name, record_key) if record_key else None
+    record_token = None
+    if owner and item.created_at >= owner.origin.created_at:
+        try:
+            current = GenericTableRepository().get_row(item.schema_name, item.table_name, record_key)
+            if current is not None and verified_owned_record(item.schema_name, item.table_name, record_key, current):
+                record_token = make_row_token(record_key)
+        except Exception:
+            pass  # Log detail stays available when the Target DB cannot verify the row.
     return JsonResponse({
         "id": str(item.pk),
         "created_at": item.created_at,
@@ -377,6 +433,7 @@ def operation_detail(request, operation_id):
         "status": item.status,
         "actor": item.actor.get_username() if item.actor else None,
         "record_key": item.record_key,
+        "record_token": record_token,
         "before_data": item.before_data,
         "after_data": item.after_data,
         "error_message": item.error_message,

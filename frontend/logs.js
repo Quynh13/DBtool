@@ -54,6 +54,9 @@ export async function showOperation(main, id) {
   link('← Operation Logs', '#/operations', main);
   node('h2', `${data.action} ${data.schema}.${data.table}`, main);
   node('p', `Status: ${data.status}; actor: ${data.actor || 'unknown'}; time: ${data.created_at}`, main);
+  if (data.record_token) {
+    link('Open record', `#/tables/${encodeURIComponent(data.schema)}/${encodeURIComponent(data.table)}/rows/${encodeURIComponent(data.record_token)}`, main);
+  }
   for (const [label, value] of [
     ['Record key', data.record_key], ['Before', data.before_data], ['After', data.after_data],
   ]) {
@@ -61,22 +64,4 @@ export async function showOperation(main, id) {
     node('pre', JSON.stringify(value, null, 2), main);
   }
   if (data.error_message) node('p', data.error_message, main);
-  if (data.can_rollback) {
-    const button = node('button', 'Rollback', main);
-    button.addEventListener('click', async () => {
-      if (button.dataset.confirm !== 'yes') {
-        button.dataset.confirm = 'yes';
-        button.textContent = `Confirm rollback ${data.action}`;
-        return;
-      }
-      button.disabled = true;
-      try {
-        await api(`operations/${encodeURIComponent(id)}/rollback/`, { method: 'POST' });
-        await showOperation(main, id);
-      } catch (exception) {
-        button.disabled = false;
-        node('p', exception.message, main).setAttribute('role', 'alert');
-      }
-    });
-  }
 }

@@ -571,6 +571,83 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
             mutation.return_value.update.assert_called_once()
             mutation.return_value.delete.assert_called_once()
 
+    def test_row_detail_shows_scoped_history_to_root_only(self):
+        self.configure_attendance()
+        TableProfile.objects.filter(table_name="attendance").update(is_released=True)
+        root = get_user_model().objects.create_superuser(
+            username="history-root", email="root@example.com", password="password",
+        )
+        key = {"id": 1}
+        current = {"id": 1, "employee_code": "E1", "note": "new"}
+        OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.DELETE,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            before_data=encode_row(current),
+        )
+        insert = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.INSERT,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            after_data=encode_row({**current, "note": "old"}), actor=root,
+        )
+        ToolOwnedRecord.objects.create(
+            schema_name="public", table_name="attendance", key_digest=key_digest(key),
+            record_key=encode_row(key), fingerprint=row_fingerprint(current),
+            origin=insert, last_operation=insert,
+        )
+        update = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.UPDATE,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            before_data=encode_row({**current, "note": "old"}),
+            after_data=encode_row(current), actor=self.user,
+        )
+        OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.UPDATE,
+            status=OperationLog.Status.APPLIED, record_key=encode_row({"id": 2}),
+            before_data=encode_row(current), after_data=encode_row(current),
+        )
+        url = reverse("api_row_detail", kwargs={
+            "schema": "public", "table": "attendance", "row_token": make_row_token(key),
+        })
+        self.assertEqual(self.client.get(url).status_code, 401)
+        with (patch("dbtool.api.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)),
+              patch("dbtool.api._owned_row", return_value=(key, current)),
+              patch("dbtool.api.GenericTableRepository") as repository):
+            repository.return_value.get_row.return_value = current
+            self.client.force_login(self.user)
+            staff_data = self.client.get(url).json()
+            self.assertEqual(staff_data["values"]["note"], "new")
+            self.assertNotIn("history", staff_data)
+            self.client.force_login(root)
+            history = self.client.get(url).json()["history"]
+            operation_data = self.client.get(reverse(
+                "api_operation_detail", kwargs={"operation_id": update.pk}
+            )).json()
+        self.assertEqual([item["id"] for item in history], [str(insert.pk), str(update.pk)])
+        self.assertEqual(history[1]["changes"], [{"column": "note", "before": "old", "after": "new"}])
+        self.assertEqual(history[1]["actor"], self.user.username)
+        self.assertEqual(load_row_token(operation_data["record_token"]), key)
+
+    def test_operation_detail_omits_record_link_when_target_row_is_missing(self):
+        key = {"id": 1}
+        operation = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.INSERT,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+        )
+        ToolOwnedRecord.objects.create(
+            schema_name="public", table_name="attendance", key_digest=key_digest(key),
+            record_key=encode_row(key), fingerprint="stale", origin=operation,
+        )
+        root = get_user_model().objects.create_superuser(
+            username="missing-row-root", email="root@example.com", password="password",
+        )
+        self.client.force_login(root)
+        url = reverse("api_operation_detail", kwargs={"operation_id": operation.pk})
+        with patch("dbtool.api.GenericTableRepository") as repository:
+            repository.return_value.get_row.return_value = None
+            response = self.client.get(url)
+        self.assertEqual(response.status_code, 200)
+        self.assertIsNone(response.json()["record_token"])
+
     def test_edit_api_reports_stale_row_without_retrying_mutation(self):
         import json
 

@@ -85,7 +85,11 @@ async function showTable(schema, name) {
   if (data.can_insert) link('Add row', `${route}/add`, main);
   const rows = data.rows.map((row) => {
     const actions = node('span');
-    if (row.row_token && data.can_update) link('Edit', `${route}/rows/${encodeURIComponent(row.row_token)}/edit`, actions);
+    if (row.row_token) link('Details', `${route}/rows/${encodeURIComponent(row.row_token)}`, actions);
+    if (row.row_token && data.can_update) {
+      actions.append(' ');
+      link('Edit', `${route}/rows/${encodeURIComponent(row.row_token)}/edit`, actions);
+    }
     if (row.row_token && data.can_delete) {
       actions.append(' ');
       link('Delete', `${route}/rows/${encodeURIComponent(row.row_token)}/delete`, actions);
@@ -95,6 +99,25 @@ async function showTable(schema, name) {
   table([...data.columns.map((column) => column.label), 'Action'], rows, main);
   if (data.page > 1) link('Previous', `${route}?page=${data.page - 1}`, main);
   if (data.page < data.total_pages) link('Next', `${route}?page=${data.page + 1}`, main);
+}
+
+async function showRowDetail(schema, name, token) {
+  const route = `#/tables/${encodeURIComponent(schema)}/${encodeURIComponent(name)}`;
+  const rowRoute = `${route}/rows/${encodeURIComponent(token)}`;
+  const data = await api(`tables/${encodeURIComponent(schema)}/${encodeURIComponent(name)}/rows/${encodeURIComponent(token)}/`);
+  link('Back to table', route, main);
+  node('h2', `Record: ${schema}.${name}`, main);
+  table(['Column', 'Value'], Object.entries(data.values), main);
+  if (data.can_update) link('Edit', `${rowRoute}/edit`, main);
+  if (data.can_delete) link('Delete', `${rowRoute}/delete`, main);
+  if (data.history) {
+    node('h3', 'Record history', main);
+    table(['Time', 'Action', 'Status', 'Actor', 'Changes', 'Log'], data.history.map((item) => [
+      item.created_at, item.action, item.status, item.actor || 'unknown',
+      item.changes.map((change) => `${change.column}: ${change.before} → ${change.after}`).join('; '),
+      link('View', `#/operations/${item.id}`),
+    ]), main);
+  }
 }
 
 function fieldControl(field, parent, schema, name) {
@@ -230,13 +253,14 @@ async function show() {
     if (location.hash.startsWith('#/operations?') || location.hash === '#/operations') return await showLogs(main);
     const operation = location.hash.match(/^#\/operations\/([0-9a-f-]+)$/);
     if (operation) return await showOperation(main, operation[1]);
-    const match = location.hash.match(/^#\/tables\/([^/?]+)\/([^/?]+)(?:\/rows\/([^/?]+)\/(edit|delete)|\/(add))?/);
+    const match = location.hash.match(/^#\/tables\/([^/?]+)\/([^/?]+)(?:\/rows\/([^/?]+)(?:\/(edit|delete))?|\/(add))?/);
     if (match) {
       const schema = decodeURIComponent(match[1]);
       const name = decodeURIComponent(match[2]);
       if (match[5]) await showRowForm(schema, name, 'add');
       else if (match[4] === 'edit') await showRowForm(schema, name, 'edit', decodeURIComponent(match[3]));
       else if (match[4] === 'delete') await showDelete(schema, name, decodeURIComponent(match[3]));
+      else if (match[3]) await showRowDetail(schema, name, decodeURIComponent(match[3]));
       else await showTable(schema, name);
     }
     else await showTables();
