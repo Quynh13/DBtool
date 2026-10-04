@@ -594,6 +594,28 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
             self.assertEqual(self.client.get(reverse("api_configuration")).status_code, 403)
             self.assertEqual(self.client.get(reverse("api_table_review", kwargs={"schema": "public", "table": "attendance"})).status_code, 403)
 
+    def test_operation_api_is_root_only_and_uses_rollback_service(self):
+        operation = OperationLog.objects.create(
+            schema_name="public", table_name="attendance",
+            action=OperationLog.Action.INSERT, status=OperationLog.Status.APPLIED,
+        )
+        detail = reverse("api_operation_detail", kwargs={"operation_id": operation.pk})
+        rollback = reverse("api_operation_rollback", kwargs={"operation_id": operation.pk})
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(reverse("api_operation_list")).status_code, 403)
+        self.assertEqual(self.client.get(detail).status_code, 403)
+        self.assertEqual(self.client.post(rollback).status_code, 403)
+
+        root = get_user_model().objects.create_superuser(
+            username="frontend-root", email="root@example.com", password="password",
+        )
+        self.client.force_login(root)
+        self.assertEqual(self.client.get(reverse("api_operation_list")).json()["operations"][0]["id"], str(operation.pk))
+        self.assertTrue(self.client.get(detail).json()["can_rollback"])
+        with patch("dbtool.api.RollbackService") as service:
+            self.assertEqual(self.client.post(rollback).status_code, 200)
+            service.return_value.rollback.assert_called_once_with(operation)
+
 
 class SemanticMetadataTests(SemanticFixture, TestCase):
 

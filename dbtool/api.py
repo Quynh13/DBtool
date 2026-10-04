@@ -7,15 +7,17 @@ from django.core.exceptions import PermissionDenied
 from django.http import Http404, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import ensure_csrf_cookie
-from django.views.decorators.http import require_GET, require_http_methods
+from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
+from audit.models import OperationLog
 from dbtool.forms import build_row_form
 from dbtool.introspection import SchemaIntrospector
-from dbtool.models import ColumnProfile
+from dbtool.models import ColumnProfile, ConfigurationEvent
 from dbtool.mutations import MutationService, RowNotFound, StaleRowError
 from dbtool.ownership import owned_record, verified_owned_record
 from dbtool.repository import GenericTableRepository
 from dbtool.row_state import load_row_token, load_state_token, make_state_token
+from dbtool.rollback import RollbackService
 from dbtool.semantics import EffectiveMetadataService
 from dbtool.views import (
     _display_value,
@@ -308,3 +310,93 @@ def table_release(request, schema, table):
 @staff_required
 def table_unrelease(request, schema, table):
     return legacy_table_unrelease(request, schema, table)
+
+
+def _root(request):
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only a superuser can view operation logs.")
+
+
+@require_GET
+@staff_required
+def operation_list(request):
+    _root(request)
+    try:
+        page = max(1, int(request.GET.get("page", 1)))
+    except ValueError:
+        page = 1
+    logs = OperationLog.objects.select_related("actor").order_by("-created_at")
+    total = logs.count()
+    page_size = 50
+    items = logs[(page - 1) * page_size:page * page_size]
+    events = ConfigurationEvent.objects.select_related("actor")[:50] if page == 1 else []
+    return JsonResponse({
+        "page": page,
+        "total_pages": max(1, (total + page_size - 1) // page_size),
+        "operations": [
+            {
+                "id": str(item.pk),
+                "created_at": item.created_at,
+                "action": item.action,
+                "schema": item.schema_name,
+                "table": item.table_name,
+                "status": item.status,
+                "actor": item.actor.get_username() if item.actor else None,
+            }
+            for item in items
+        ],
+        "configuration_events": [
+            {
+                "created_at": item.created_at,
+                "schema": item.schema_name,
+                "table": item.table_name,
+                "action": item.action,
+                "actor": item.actor.get_username() if item.actor else None,
+                "was_released": item.was_released,
+                "is_released": item.is_released,
+            }
+            for item in events
+        ],
+    })
+
+
+@require_GET
+@staff_required
+def operation_detail(request, operation_id):
+    _root(request)
+    try:
+        item = OperationLog.objects.select_related("actor").get(pk=operation_id)
+    except OperationLog.DoesNotExist:
+        return JsonResponse({"error": "Operation not found."}, status=404)
+    return JsonResponse({
+        "id": str(item.pk),
+        "created_at": item.created_at,
+        "action": item.action,
+        "schema": item.schema_name,
+        "table": item.table_name,
+        "status": item.status,
+        "actor": item.actor.get_username() if item.actor else None,
+        "record_key": item.record_key,
+        "before_data": item.before_data,
+        "after_data": item.after_data,
+        "error_message": item.error_message,
+        "rolled_back_at": item.rolled_back_at,
+        "can_rollback": item.status in {OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED},
+    })
+
+
+@require_POST
+@staff_required
+def operation_rollback(request, operation_id):
+    _root(request)
+    try:
+        item = OperationLog.objects.get(pk=operation_id)
+    except OperationLog.DoesNotExist:
+        return JsonResponse({"error": "Operation not found."}, status=404)
+    if item.status not in {OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED}:
+        return JsonResponse({"error": "This operation cannot be rolled back."}, status=403)
+    try:
+        RollbackService().rollback(item)
+    except Exception as exc:
+        return JsonResponse({"error": f"Rollback blocked: {exc}"}, status=409)
+    return JsonResponse({"ok": True})

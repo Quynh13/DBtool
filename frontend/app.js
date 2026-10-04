@@ -1,5 +1,6 @@
 import { api } from './api.js';
 import { showConfiguration, showReview } from './config.js';
+import { showLogs, showOperation } from './logs.js';
 
 const main = document.getElementById('main');
 const nav = document.getElementById('nav');
@@ -215,6 +216,7 @@ async function show() {
   if (!session.authenticated) return loginScreen();
   link('Database Editor', '#/', nav);
   if (session.is_superuser) link('Database Configuration', '#/configuration', nav);
+  if (session.is_superuser) link('Operation Logs', '#/operations', nav);
   const signOut = node('button', 'Sign out', nav);
   signOut.addEventListener('click', async () => {
     await api('session/', { method: 'DELETE' });
@@ -225,6 +227,9 @@ async function show() {
     if (location.hash === '#/configuration') return await showConfiguration(main);
     const review = location.hash.match(/^#\/configuration\/([^/?]+)\/([^/?]+)/);
     if (review) return await showReview(main, decodeURIComponent(review[1]), decodeURIComponent(review[2]));
+    if (location.hash.startsWith('#/operations?') || location.hash === '#/operations') return await showLogs(main);
+    const operation = location.hash.match(/^#\/operations\/([0-9a-f-]+)$/);
+    if (operation) return await showOperation(main, operation[1]);
     const match = location.hash.match(/^#\/tables\/([^/?]+)\/([^/?]+)(?:\/rows\/([^/?]+)\/(edit|delete)|\/(add))?/);
     if (match) {
       const schema = decodeURIComponent(match[1]);

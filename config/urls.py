@@ -17,6 +17,9 @@ urlpatterns = [
     path("api/v1/configuration/<str:schema>/<str:table>/", api.table_review, name="api_table_review"),
     path("api/v1/configuration/<str:schema>/<str:table>/release/", api.table_release, name="api_table_release"),
     path("api/v1/configuration/<str:schema>/<str:table>/unrelease/", api.table_unrelease, name="api_table_unrelease"),
+    path("api/v1/operations/", api.operation_list, name="api_operation_list"),
+    path("api/v1/operations/<uuid:operation_id>/", api.operation_detail, name="api_operation_detail"),
+    path("api/v1/operations/<uuid:operation_id>/rollback/", api.operation_rollback, name="api_operation_rollback"),
     path(
         "admin/db-editor/",
         include("dbtool.urls"),
