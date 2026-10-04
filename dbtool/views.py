@@ -333,7 +333,7 @@ def database_configuration(request):
     )
 
 
-def table_detail(request, schema, table):
+def table_detail_context(request, schema, table):
     introspector = SchemaIntrospector()
     repository = GenericTableRepository()
 
@@ -445,10 +445,7 @@ def table_detail(request, schema, table):
         ", ".join(definition.primary_key) if definition.primary_key else "None"
     )
 
-    return render(
-        request,
-        "dbtool/table_detail.html",
-        {
+    return {
             "definition": definition,
             "display_label": effective.display_label,
             "capabilities": capabilities,
@@ -476,7 +473,14 @@ def table_detail(request, schema, table):
                 len(definition.columns) + 1,
                 1,
             ),
-        },
+    }
+
+
+def table_detail(request, schema, table):
+    return render(
+        request,
+        "dbtool/table_detail.html",
+        table_detail_context(request, schema, table),
     )
 
 

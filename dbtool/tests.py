@@ -468,11 +468,24 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
             username="frontend-staff", password="password", is_staff=True,
         )
 
-    def test_shell_requires_staff_session(self):
+    def test_shell_is_public_for_login(self):
         response = self.client.get(reverse("frontend"))
-        self.assertEqual(response.status_code, 302)
-        self.client.force_login(self.user)
-        self.assertContains(self.client.get(reverse("frontend")), "Database Editor")
+        self.assertContains(response, "Database Editor")
+        self.assertIn("csrftoken", response.cookies)
+
+    def test_session_login_and_logout(self):
+        import json
+
+        self.assertFalse(self.client.get(reverse("api_session")).json()["authenticated"])
+        response = self.client.post(
+            reverse("api_session"),
+            data=json.dumps({"username": self.user.username, "password": "password"}),
+            content_type="application/json",
+        )
+        self.assertTrue(response.json()["authenticated"])
+        self.assertFalse(response.json()["is_superuser"])
+        self.assertEqual(self.client.delete(reverse("api_session")).status_code, 200)
+        self.assertFalse(self.client.get(reverse("api_session")).json()["authenticated"])
 
     def test_api_only_lists_released_tables(self):
         self.configure_attendance()
@@ -488,11 +501,27 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
         self.assertEqual([table["name"] for table in response.json()["tables"]], ["attendance"])
 
     def test_api_rejects_unauthenticated_and_non_staff(self):
-        self.assertEqual(self.client.get(reverse("api_table_list")).status_code, 302)
+        self.assertEqual(self.client.get(reverse("api_table_list")).status_code, 401)
         self.user.is_staff = False
         self.user.save(update_fields=["is_staff"])
         self.client.force_login(self.user)
-        self.assertEqual(self.client.get(reverse("api_table_list")).status_code, 302)
+        self.assertEqual(self.client.get(reverse("api_table_list")).status_code, 403)
+
+    def test_detail_requires_release_and_returns_columns(self):
+        self.configure_attendance()
+        self.client.force_login(self.user)
+        url = reverse("api_table_detail", kwargs={"schema": "public", "table": "attendance"})
+        with patch("dbtool.views.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)):
+            self.assertEqual(self.client.get(url).status_code, 403)
+        TableProfile.objects.filter(table_name="attendance").update(is_released=True)
+        with (patch("dbtool.views.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)),
+              patch("dbtool.views.GenericTableRepository") as repository):
+            response = self.client.get(url)
+            repository.return_value.list_rows.assert_not_called()
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json()["total_rows"], 0)
+        self.assertEqual([column["name"] for column in response.json()["columns"]],
+                         ["id", "employee_code", "note"])
 
 
 class SemanticMetadataTests(SemanticFixture, TestCase):

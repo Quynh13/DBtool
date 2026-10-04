@@ -1,0 +1,8 @@
+body { font: 16px system-ui, sans-serif; max-width: 1200px; margin: auto; padding: 1rem; color: #222; }
+header { display: flex; align-items: center; justify-content: space-between; gap: 1rem; }
+nav { display: flex; align-items: center; gap: 1rem; }
+table { border-collapse: collapse; width: 100%; overflow-x: auto; display: block; }
+th, td { border: 1px solid #ccc; padding: .5rem; text-align: left; }
+input, button { font: inherit; padding: .4rem; margin: .2rem; }
+a { color: #0645ad; }
+[role="alert"] { color: #9b1c1c; }
