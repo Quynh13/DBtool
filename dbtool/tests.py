@@ -456,6 +456,45 @@ class SemanticFixture:
         )
 
 
+@override_settings(
+    STORAGES={
+        "default": {"BACKEND": "django.core.files.storage.FileSystemStorage"},
+        "staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"},
+    }
+)
+class FrontendBootstrapTests(SemanticFixture, TestCase):
+    def setUp(self):
+        self.user = get_user_model().objects.create_user(
+            username="frontend-staff", password="password", is_staff=True,
+        )
+
+    def test_shell_requires_staff_session(self):
+        response = self.client.get(reverse("frontend"))
+        self.assertEqual(response.status_code, 302)
+        self.client.force_login(self.user)
+        self.assertContains(self.client.get(reverse("frontend")), "Database Editor")
+
+    def test_api_only_lists_released_tables(self):
+        self.configure_attendance()
+        self.client.force_login(self.user)
+        with patch("dbtool.views.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)):
+            response = self.client.get(reverse("api_table_list"))
+        self.assertEqual(response.json(), {"tables": []})
+
+        TableProfile.objects.filter(table_name="attendance").update(is_released=True)
+        with patch("dbtool.views.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)):
+            response = self.client.get(reverse("api_table_list"))
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual([table["name"] for table in response.json()["tables"]], ["attendance"])
+
+    def test_api_rejects_unauthenticated_and_non_staff(self):
+        self.assertEqual(self.client.get(reverse("api_table_list")).status_code, 302)
+        self.user.is_staff = False
+        self.user.save(update_fields=["is_staff"])
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(reverse("api_table_list")).status_code, 302)
+
+
 class SemanticMetadataTests(SemanticFixture, TestCase):
 
     def test_new_profile_is_not_released(self):

@@ -222,7 +222,7 @@ def _column_review_initial(column, profile, capability):
     return initial
 
 
-def table_list(request):
+def released_tables():
     introspector = SchemaIntrospector()
     metadata = EffectiveMetadataService(introspector=introspector)
 
@@ -259,11 +259,15 @@ def table_list(request):
             }
         )
 
+    return tables
+
+
+def table_list(request):
     return render(
         request,
         "dbtool/table_list.html",
         {
-            "tables": tables,
+            "tables": released_tables(),
         },
     )
 

@@ -1,0 +1,20 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Database Editor</title>
+    <script type="module" src="{% static 'app.js' %}"></script>
+</head>
+<body>
+    <header><h1>Database Editor</h1></header>
+    <main>
+        <p id="status" role="status">Loading tables…</p>
+        <table hidden id="tables">
+            <thead><tr><th>Schema</th><th>Table</th><th>Status</th><th>Action</th></tr></thead>
+            <tbody></tbody>
+        </table>
+    </main>
+</body>
+</html>

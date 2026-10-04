@@ -74,7 +74,7 @@ ROOT_URLCONF = "config.urls"
 TEMPLATES = [
     {
         "BACKEND": "django.template.backends.django.DjangoTemplates",
-        "DIRS": [],
+        "DIRS": [BASE_DIR / "frontend"],
         "APP_DIRS": True,
         "OPTIONS": {
             "context_processors": [
@@ -159,6 +159,7 @@ MAILERS = {
 
 STATIC_URL = "static/"
 STATIC_ROOT = BASE_DIR / "staticfiles"
+STATICFILES_DIRS = [BASE_DIR / "frontend"]
 
 STORAGES = {
     "default": {
