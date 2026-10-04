@@ -64,11 +64,17 @@ export async function showOperation(main, id) {
   if (data.can_rollback) {
     const button = node('button', 'Rollback', main);
     button.addEventListener('click', async () => {
-      if (!confirm(`Rollback ${data.action} on ${data.schema}.${data.table}?`)) return;
+      if (button.dataset.confirm !== 'yes') {
+        button.dataset.confirm = 'yes';
+        button.textContent = `Confirm rollback ${data.action}`;
+        return;
+      }
+      button.disabled = true;
       try {
         await api(`operations/${encodeURIComponent(id)}/rollback/`, { method: 'POST' });
         await showOperation(main, id);
       } catch (exception) {
+        button.disabled = false;
         node('p', exception.message, main).setAttribute('role', 'alert');
       }
     });
