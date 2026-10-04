@@ -3,7 +3,8 @@ from functools import wraps
 
 from django.contrib.auth import authenticate, login, logout
 from django.core import signing
-from django.http import JsonResponse
+from django.core.exceptions import PermissionDenied
+from django.http import Http404, JsonResponse
 from django.shortcuts import render
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_http_methods
@@ -21,6 +22,10 @@ from dbtool.views import (
     lookup_search as legacy_lookup_search,
     released_tables,
     table_detail_context,
+    database_configuration_tables,
+    table_review as legacy_table_review,
+    table_release as legacy_table_release,
+    table_unrelease as legacy_table_unrelease,
 )
 
 
@@ -62,7 +67,12 @@ def staff_required(view):
             return JsonResponse({"error": "Login required."}, status=401)
         if not request.user.is_active or not request.user.is_staff:
             return JsonResponse({"error": "Staff access required."}, status=403)
-        return view(request, *args, **kwargs)
+        try:
+            return view(request, *args, **kwargs)
+        except PermissionDenied as exc:
+            return JsonResponse({"error": str(exc)}, status=403)
+        except Http404 as exc:
+            return JsonResponse({"error": str(exc)}, status=404)
     return wrapped
 
 
@@ -277,3 +287,24 @@ def row_delete(request, schema, table, row_token):
 @staff_required
 def lookup_search(request, schema, table, column):
     return legacy_lookup_search(request, schema, table, column)
+
+
+@require_GET
+@staff_required
+def configuration(request):
+    return JsonResponse({"tables": database_configuration_tables(request)})
+
+
+@staff_required
+def table_review(request, schema, table):
+    return legacy_table_review(request, schema, table)
+
+
+@staff_required
+def table_release(request, schema, table):
+    return legacy_table_release(request, schema, table)
+
+
+@staff_required
+def table_unrelease(request, schema, table):
+    return legacy_table_unrelease(request, schema, table)

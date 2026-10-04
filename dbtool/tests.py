@@ -588,6 +588,12 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
             self.assertEqual(response.status_code, 409)
             mutation.return_value.update.assert_called_once()
 
+    def test_configuration_api_is_root_only(self):
+        self.client.force_login(self.user)
+        with patch("dbtool.views.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)):
+            self.assertEqual(self.client.get(reverse("api_configuration")).status_code, 403)
+            self.assertEqual(self.client.get(reverse("api_table_review", kwargs={"schema": "public", "table": "attendance"})).status_code, 403)
+
 
 class SemanticMetadataTests(SemanticFixture, TestCase):
 
@@ -1131,6 +1137,33 @@ class AutoUnreleaseTests(SemanticFixture, TestCase):
     def assert_unreleased(self):
         self.profile.refresh_from_db()
         self.assertFalse(self.profile.is_released)
+
+    def test_api_review_no_op_then_change_unreleases(self):
+        url = reverse("api_table_review", kwargs={"schema": "public", "table": "attendance"})
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            opened = self.client.get(url)
+            self.assertEqual(opened.status_code, 200)
+            self.assertTrue(opened.json()["can_unrelease"])
+            no_op = self.client.post(url, self.review_data())
+            self.assertEqual(no_op.status_code, 200)
+            self.assert_released()
+            data = self.review_data()
+            data["table-display_label"] = "Attendance Events"
+            changed = self.client.post(url, data)
+        self.assertEqual(changed.status_code, 200)
+        self.assert_unreleased()
+
+    def test_api_release_and_unrelease(self):
+        url = reverse("api_table_unrelease", kwargs={"schema": "public", "table": "attendance"})
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            response = self.client.post(url)
+        self.assertEqual(response.status_code, 200)
+        self.assert_unreleased()
+        url = reverse("api_table_release", kwargs={"schema": "public", "table": "attendance"})
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            response = self.client.post(url)
+        self.assertEqual(response.status_code, 200)
+        self.assert_released()
 
     def test_opening_configuration_does_not_unrelease(self):
         with patch(

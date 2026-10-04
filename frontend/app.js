@@ -1,4 +1,5 @@
 import { api } from './api.js';
+import { showConfiguration, showReview } from './config.js';
 
 const main = document.getElementById('main');
 const nav = document.getElementById('nav');
@@ -213,6 +214,7 @@ async function show() {
   nav.replaceChildren();
   if (!session.authenticated) return loginScreen();
   link('Database Editor', '#/', nav);
+  if (session.is_superuser) link('Database Configuration', '#/configuration', nav);
   const signOut = node('button', 'Sign out', nav);
   signOut.addEventListener('click', async () => {
     await api('session/', { method: 'DELETE' });
@@ -220,6 +222,9 @@ async function show() {
   });
   main.replaceChildren();
   try {
+    if (location.hash === '#/configuration') return await showConfiguration(main);
+    const review = location.hash.match(/^#\/configuration\/([^/?]+)\/([^/?]+)/);
+    if (review) return await showReview(main, decodeURIComponent(review[1]), decodeURIComponent(review[2]));
     const match = location.hash.match(/^#\/tables\/([^/?]+)\/([^/?]+)(?:\/rows\/([^/?]+)\/(edit|delete)|\/(add))?/);
     if (match) {
       const schema = decodeURIComponent(match[1]);

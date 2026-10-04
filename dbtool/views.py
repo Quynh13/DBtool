@@ -272,7 +272,7 @@ def table_list(request):
     )
 
 
-def database_configuration(request):
+def database_configuration_tables(request):
     if not request.user.is_superuser:
         raise PermissionDenied(
             "Only a superuser can access database configuration."
@@ -326,10 +326,14 @@ def database_configuration(request):
             }
         )
 
+    return tables
+
+
+def database_configuration(request):
     return render(
         request,
         "dbtool/database_configuration.html",
-        {"tables": tables},
+        {"tables": database_configuration_tables(request)},
     )
 
 
@@ -620,6 +624,8 @@ def table_review(request, schema, table):
                 introspector=introspector
             ).resolve(definition).configuration_status
             messages.success(request, f"Configuration saved. Status: {status}. Release separately when ready.")
+            if request.path.startswith("/api/"):
+                return JsonResponse({"ok": True, "configuration_status": status})
             return redirect(
                 "dbtool:table_review",
                 schema=schema,
@@ -629,10 +635,7 @@ def table_review(request, schema, table):
     effective = EffectiveMetadataService(introspector=introspector).resolve(
         definition
     )
-    return render(
-        request,
-        "dbtool/table_review.html",
-        {
+    context = {
             "definition": definition,
             "status": effective.status,
             "configuration_status": effective.configuration_status,
@@ -652,8 +655,40 @@ def table_review(request, schema, table):
             "catalog": catalog,
             "definition_columns": [column.name for column in definition.columns],
             "release_blockers": _release_blockers(effective),
-        },
-    )
+    }
+    if request.path.startswith("/api/"):
+        return JsonResponse({
+            "schema": schema,
+            "table": table,
+            "table_type": definition.table_type,
+            "primary_key": definition.primary_key,
+            "configuration_status": context["configuration_status"],
+            "release_status": context["release_status"],
+            "can_release": context["can_release"],
+            "can_unrelease": context["can_unrelease"],
+            "release_blockers": context["release_blockers"],
+            "catalog": catalog,
+            "table_form": {
+                "values": {name: table_form[name].value() for name in table_form.fields},
+                "errors": table_form.errors.get_json_data(),
+            },
+            "columns": [
+                {
+                    "name": column.name,
+                    "data_type": column.data_type,
+                    "nullable": column.nullable,
+                    "default": column.default,
+                    "primary_key": column.primary_key,
+                    "identity": column.identity,
+                    "generated": column.generated,
+                    "prefix": form.prefix,
+                    "values": {name: form[name].value() for name in form.fields},
+                    "errors": form.errors.get_json_data(),
+                }
+                for column, form in column_forms
+            ],
+        }, status=400 if request.method == "POST" else 200)
+    return render(request, "dbtool/table_review.html", context)
 
 
 @require_POST
@@ -686,6 +721,8 @@ def table_release(request, schema, table):
             is_released=True,
         )
     messages.success(request, f"{schema}.{table} released.")
+    if request.path.startswith("/api/"):
+        return JsonResponse({"ok": True, "release_status": "RELEASED"})
     return redirect("dbtool:database_configuration")
 
 
@@ -718,6 +755,8 @@ def table_unrelease(request, schema, table):
             is_released=False,
         )
     messages.success(request, f"{schema}.{table} unreleased.")
+    if request.path.startswith("/api/"):
+        return JsonResponse({"ok": True, "release_status": "NOT RELEASED"})
     return redirect("dbtool:database_configuration")
 
 
