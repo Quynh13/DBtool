@@ -13,6 +13,10 @@ export async function api(path, options = {}) {
     },
   });
   const data = await response.json();
-  if (!response.ok) throw new Error(data.error || `Request failed (${response.status})`);
+  if (!response.ok) {
+    const error = new Error(data.error || `Request failed (${response.status})`);
+    error.data = data;
+    throw error;
+  }
   return data;
 }

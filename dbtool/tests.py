@@ -19,7 +19,7 @@ from dbtool.row_state import (
 )
 from dbtool.models import ColumnProfile, ConfigurationEvent, LookupMapping, TableProfile
 from dbtool.forms import ColumnReviewForm, build_row_form
-from dbtool.mutations import MutationNotAllowed, MutationService
+from dbtool.mutations import MutationNotAllowed, MutationService, StaleRowError
 from audit.codec import encode_row
 from audit.models import OperationLog, ToolOwnedRecord
 from dbtool.ownership import key_digest
@@ -522,6 +522,71 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
         self.assertEqual(response.json()["total_rows"], 0)
         self.assertEqual([column["name"] for column in response.json()["columns"]],
                          ["id", "employee_code", "note"])
+
+    def test_add_api_uses_existing_form_and_mutation_service(self):
+        import json
+
+        self.configure_attendance()
+        TableProfile.objects.filter(table_name="attendance").update(is_released=True)
+        self.client.force_login(self.user)
+        url = reverse("api_row_add", kwargs={"schema": "public", "table": "attendance"})
+        with (patch("dbtool.api.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)),
+              patch("dbtool.api.MutationService") as mutation):
+            self.assertEqual(self.client.get(url).status_code, 200)
+            invalid = self.client.post(url, data=json.dumps({"note": "test"}), content_type="application/json")
+            self.assertEqual(invalid.status_code, 400)
+            mutation.return_value.insert.assert_not_called()
+            valid = self.client.post(url, data=json.dumps({"employee_code": "E1", "note": "test"}), content_type="application/json")
+            self.assertEqual(valid.status_code, 200)
+            mutation.return_value.insert.assert_called_once()
+
+    def test_add_api_rejects_unreleased_table(self):
+        self.configure_attendance()
+        self.client.force_login(self.user)
+        url = reverse("api_row_add", kwargs={"schema": "public", "table": "attendance"})
+        with patch("dbtool.api.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)):
+            self.assertEqual(self.client.get(url).status_code, 403)
+
+    def test_edit_and_delete_api_require_state_token(self):
+        import json
+
+        self.configure_attendance()
+        TableProfile.objects.filter(table_name="attendance").update(is_released=True)
+        self.client.force_login(self.user)
+        key = {"id": 1}
+        current = {"id": 1, "employee_code": "E1", "note": "old"}
+        kwargs = {"schema": "public", "table": "attendance", "row_token": make_row_token(key)}
+        edit_url = reverse("api_row_edit", kwargs=kwargs)
+        delete_url = reverse("api_row_delete", kwargs=kwargs)
+        with (patch("dbtool.api.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)),
+              patch("dbtool.api._owned_row", return_value=(key, current)),
+              patch("dbtool.api.MutationService") as mutation):
+            state = self.client.get(edit_url).json()["state_token"]
+            self.assertEqual(self.client.post(edit_url, data=json.dumps({"note": "new", "state_token": "bad"}), content_type="application/json").status_code, 403)
+            self.assertEqual(self.client.post(delete_url, data=json.dumps({"state_token": "bad"}), content_type="application/json").status_code, 403)
+            mutation.return_value.update.assert_not_called()
+            mutation.return_value.delete.assert_not_called()
+            self.assertEqual(self.client.post(edit_url, data=json.dumps({"employee_code": "E1", "note": "new", "state_token": state}), content_type="application/json").status_code, 200)
+            self.assertEqual(self.client.post(delete_url, data=json.dumps({"state_token": state}), content_type="application/json").status_code, 200)
+            mutation.return_value.update.assert_called_once()
+            mutation.return_value.delete.assert_called_once()
+
+    def test_edit_api_reports_stale_row_without_retrying_mutation(self):
+        import json
+
+        self.configure_attendance()
+        TableProfile.objects.filter(table_name="attendance").update(is_released=True)
+        self.client.force_login(self.user)
+        key = {"id": 1}
+        current = {"id": 1, "employee_code": "E1", "note": "old"}
+        url = reverse("api_row_edit", kwargs={"schema": "public", "table": "attendance", "row_token": make_row_token(key)})
+        with (patch("dbtool.api.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)),
+              patch("dbtool.api._owned_row", return_value=(key, current)),
+              patch("dbtool.api.MutationService") as mutation):
+            mutation.return_value.update.side_effect = StaleRowError("stale")
+            response = self.client.post(url, data=json.dumps({"employee_code": "E1", "note": "new", "state_token": make_state_token(key, current)}), content_type="application/json")
+            self.assertEqual(response.status_code, 409)
+            mutation.return_value.update.assert_called_once()
 
 
 class SemanticMetadataTests(SemanticFixture, TestCase):
