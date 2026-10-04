@@ -47,7 +47,7 @@ class OperationLogAdmin(admin.ModelAdmin):
         self,
         obj,
     ):
-        if obj.status not in {
+        if obj.action != OperationLog.Action.DELETE or obj.status not in {
             OperationLog.Status.APPLIED,
             OperationLog.Status.ROLLBACK_FAILED,
         }:
@@ -66,6 +66,12 @@ class OperationLogAdmin(admin.ModelAdmin):
         )
 
     rollback_link.short_description = "Rollback"
+
+    def has_view_permission(self, request, obj=None):
+        return request.user.is_superuser
+
+    def has_change_permission(self, request, obj=None):
+        return request.user.is_superuser
 
     def has_add_permission(
         self,

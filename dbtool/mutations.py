@@ -5,9 +5,10 @@ from audit.codec import encode_row
 from audit.models import OperationLog, ToolOwnedRecord
 from dbtool.introspection import SchemaIntrospector
 from dbtool.forms import parse_fixed_insert_value
-from dbtool.models import ColumnProfile
+from dbtool.models import ColumnProfile, ConfigurationEvent
 from dbtool.repository import GenericTableRepository
 from dbtool.ownership import key_digest, owned_record
+from dbtool.access import can_access_record
 from dbtool.row_state import row_fingerprint
 from dbtool.semantic_validation import SemanticValidationError, SemanticValidator
 from dbtool.semantics import EffectiveMetadataService
@@ -85,6 +86,12 @@ class MutationService:
         if not capabilities.can_insert:
             raise MutationNotAllowed("INSERT is not allowed for this table.")
 
+        form_release = ConfigurationEvent.objects.filter(
+            schema_name=schema, table_name=table,
+            action=ConfigurationEvent.Action.RELEASE,
+            visible_fields__isnull=False,
+        ).order_by("-pk").first()
+
         operation = None
         try:
             with transaction.atomic(using="target"):
@@ -121,6 +128,7 @@ class MutationService:
                     action=OperationLog.Action.INSERT,
                     status=OperationLog.Status.PENDING,
                     actor=actor,
+                    form_release=form_release,
                 )
                 after = self.repository.insert_row(schema, table, values)
                 record_key = {
@@ -158,8 +166,9 @@ class MutationService:
                 existing.last_operation = operation
                 existing.active = True
                 existing.save(update_fields=["record_key", "fingerprint", "origin", "last_operation", "active"])
+            operation.record_origin = operation
             operation.status = OperationLog.Status.APPLIED
-            operation.save(update_fields=["status"])
+            operation.save(update_fields=["record_origin", "status"])
 
         return after, operation
 
@@ -185,7 +194,7 @@ class MutationService:
             raise MutationNotAllowed("UPDATE is not allowed for this table.")
 
         owned = owned_record(schema, table, record_key)
-        if owned is None:
+        if not can_access_record(actor, owned):
             raise MutationNotAllowed("Only rows created by this tool may be updated.")
 
         allowed_columns = {
@@ -240,6 +249,12 @@ class MutationService:
                     table_name=table,
                     action=(OperationLog.Action.UPDATE),
                     record_key=encode_row(record_key),
+                    record_origin=owned.origin,
+                    form_release=ConfigurationEvent.objects.filter(
+                        schema_name=schema, table_name=table,
+                        action=ConfigurationEvent.Action.RELEASE,
+                        visible_fields__isnull=False,
+                    ).order_by("-pk").first(),
                     before_data=encode_row(before),
                     status=(OperationLog.Status.PENDING),
                     actor=actor,
@@ -309,7 +324,7 @@ class MutationService:
             raise MutationNotAllowed("DELETE is not allowed for this table.")
 
         owned = owned_record(schema, table, record_key)
-        if owned is None:
+        if not can_access_record(actor, owned):
             raise MutationNotAllowed("Only rows created by this tool may be deleted.")
 
         operation = None
@@ -340,6 +355,12 @@ class MutationService:
                     table_name=table,
                     action=(OperationLog.Action.DELETE),
                     record_key=encode_row(record_key),
+                    record_origin=owned.origin,
+                    form_release=ConfigurationEvent.objects.filter(
+                        schema_name=schema, table_name=table,
+                        action=ConfigurationEvent.Action.RELEASE,
+                        visible_fields__isnull=False,
+                    ).order_by("-pk").first(),
                     before_data=encode_row(before),
                     status=(OperationLog.Status.PENDING),
                     actor=actor,

@@ -2,6 +2,7 @@ from contextlib import nullcontext
 from unittest.mock import patch
 
 from django.contrib.auth import get_user_model
+from django.contrib.auth.models import Group
 from django.core import signing
 from django.test import SimpleTestCase, TestCase, override_settings
 from django.urls import resolve, reverse
@@ -77,6 +78,7 @@ class NavigationTests(TestCase):
             password="password",
             is_staff=True,
         )
+        self.normal_user.groups.add(Group.objects.create(name="dbtool"))
 
     def test_root_navigation_links_editor_configuration_and_logs(self):
         self.client.force_login(self.root)
@@ -467,6 +469,7 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
         self.user = get_user_model().objects.create_user(
             username="frontend-staff", password="password", is_staff=True,
         )
+        self.user.groups.add(Group.objects.create(name="dbtool"))
 
     def test_shell_is_public_for_login(self):
         response = self.client.get(reverse("frontend"))
@@ -587,8 +590,10 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
         insert = OperationLog.objects.create(
             schema_name="public", table_name="attendance", action=OperationLog.Action.INSERT,
             status=OperationLog.Status.APPLIED, record_key=encode_row(key),
-            after_data=encode_row({**current, "note": "old"}), actor=root,
+            after_data=encode_row({**current, "note": "old"}), actor=self.user,
         )
+        insert.record_origin = insert
+        insert.save(update_fields=["record_origin"])
         ToolOwnedRecord.objects.create(
             schema_name="public", table_name="attendance", key_digest=key_digest(key),
             record_key=encode_row(key), fingerprint=row_fingerprint(current),
@@ -597,8 +602,9 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
         update = OperationLog.objects.create(
             schema_name="public", table_name="attendance", action=OperationLog.Action.UPDATE,
             status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            record_origin=insert,
             before_data=encode_row({**current, "note": "old"}),
-            after_data=encode_row(current), actor=self.user,
+            after_data=encode_row(current), actor=root,
         )
         OperationLog.objects.create(
             schema_name="public", table_name="attendance", action=OperationLog.Action.UPDATE,
@@ -616,7 +622,8 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
             self.client.force_login(self.user)
             staff_data = self.client.get(url).json()
             self.assertEqual(staff_data["values"]["note"], "new")
-            self.assertNotIn("history", staff_data)
+            self.assertEqual(len(staff_data["history"]), 2)
+            self.assertIsNone(staff_data["history"][1]["id"])
             self.client.force_login(root)
             history = self.client.get(url).json()["history"]
             operation_data = self.client.get(reverse(
@@ -624,7 +631,7 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
             )).json()
         self.assertEqual([item["id"] for item in history], [str(insert.pk), str(update.pk)])
         self.assertEqual(history[1]["changes"], [{"column": "note", "before": "old", "after": "new"}])
-        self.assertEqual(history[1]["actor"], self.user.username)
+        self.assertEqual(history[1]["actor"], root.username)
         self.assertEqual(load_row_token(operation_data["record_token"]), key)
 
     def test_operation_detail_omits_record_link_when_target_row_is_missing(self):
@@ -674,7 +681,7 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
     def test_operation_api_is_root_only_and_uses_rollback_service(self):
         operation = OperationLog.objects.create(
             schema_name="public", table_name="attendance",
-            action=OperationLog.Action.INSERT, status=OperationLog.Status.APPLIED,
+            action=OperationLog.Action.DELETE, status=OperationLog.Status.APPLIED,
         )
         detail = reverse("api_operation_detail", kwargs={"operation_id": operation.pk})
         rollback = reverse("api_operation_rollback", kwargs={"operation_id": operation.pk})
@@ -691,7 +698,163 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
         self.assertTrue(self.client.get(detail).json()["can_rollback"])
         with patch("dbtool.api.RollbackService") as service:
             self.assertEqual(self.client.post(rollback).status_code, 200)
-            service.return_value.rollback.assert_called_once_with(operation)
+            service.return_value.restore_deleted.assert_called_once_with(operation, actor=root)
+
+    def test_deleted_history_is_owner_scoped_and_only_self_delete_can_restore(self):
+        other = get_user_model().objects.create_user(
+            username="other-owner", password="password", is_staff=True,
+        )
+        other.groups.add(Group.objects.get(name="dbtool"))
+        root = get_user_model().objects.create_superuser(
+            username="deleted-root", email="root@example.com", password="password",
+        )
+        key = {"id": 1}
+        origin = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.INSERT,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key), actor=self.user,
+        )
+        origin.record_origin = origin
+        origin.save(update_fields=["record_origin"])
+        deletion = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.DELETE,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            record_origin=origin, actor=root,
+        )
+        ToolOwnedRecord.objects.create(
+            schema_name="public", table_name="attendance", key_digest=key_digest(key),
+            record_key=encode_row(key), fingerprint="deleted", origin=origin,
+            last_operation=deletion, active=False,
+        )
+        detail = reverse("api_deleted_record_detail", kwargs={"origin_id": origin.pk})
+        restore = reverse("api_deleted_record_restore", kwargs={"origin_id": origin.pk})
+        self.client.force_login(other)
+        self.assertEqual(self.client.get(detail).status_code, 404)
+        self.assertEqual(self.client.post(restore).status_code, 404)
+        self.client.force_login(self.user)
+        self.assertEqual(self.client.get(reverse("api_deleted_records")).json()["records"][0]["origin_id"], str(origin.pk))
+        self.assertFalse(self.client.get(detail).json()["can_restore"])
+        self.assertEqual(self.client.post(restore).status_code, 403)
+        self.client.force_login(root)
+        self.assertTrue(self.client.get(detail).json()["can_restore"])
+        with patch("dbtool.api.RollbackService") as service:
+            self.assertEqual(self.client.post(restore).status_code, 200)
+            service.return_value.restore_deleted.assert_called_once_with(deletion, actor=root)
+
+        deletion.actor = self.user
+        deletion.save(update_fields=["actor"])
+        self.client.force_login(self.user)
+        self.assertTrue(self.client.get(detail).json()["can_restore"])
+        with patch("dbtool.api.RollbackService") as service:
+            self.assertEqual(self.client.post(restore).status_code, 200)
+            service.return_value.restore_deleted.assert_called_once_with(deletion, actor=self.user)
+
+    def test_deleted_history_survives_key_reuse_without_restoring_new_owner_row(self):
+        other = get_user_model().objects.create_user(
+            username="key-reuse-owner", password="password", is_staff=True,
+        )
+        other.groups.add(Group.objects.get(name="dbtool"))
+        key = {"id": 1}
+        old_origin = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.INSERT,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key), actor=self.user,
+        )
+        old_origin.record_origin = old_origin
+        old_origin.save(update_fields=["record_origin"])
+        OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.DELETE,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            record_origin=old_origin, actor=self.user,
+        )
+        new_origin = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.INSERT,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key), actor=other,
+        )
+        new_origin.record_origin = new_origin
+        new_origin.save(update_fields=["record_origin"])
+        ToolOwnedRecord.objects.create(
+            schema_name="public", table_name="attendance", key_digest=key_digest(key),
+            record_key=encode_row(key), fingerprint="replacement", origin=new_origin,
+            last_operation=new_origin,
+        )
+        detail = reverse("api_deleted_record_detail", kwargs={"origin_id": old_origin.pk})
+        restore = reverse("api_deleted_record_restore", kwargs={"origin_id": old_origin.pk})
+        self.client.force_login(self.user)
+        self.assertEqual(len(self.client.get(detail).json()["history"]), 2)
+        self.assertFalse(self.client.get(detail).json()["can_restore"])
+        self.assertEqual(self.client.post(restore).status_code, 409)
+        self.client.force_login(other)
+        self.assertEqual(self.client.get(detail).status_code, 404)
+
+    def test_staff_outside_dbtool_group_cannot_use_editor(self):
+        outsider = get_user_model().objects.create_user(
+            username="outside-group", password="password", is_staff=True,
+        )
+        self.client.force_login(outsider)
+        self.assertFalse(self.client.get(reverse("api_session")).json()["authenticated"])
+        self.assertEqual(self.client.get(reverse("api_table_list")).status_code, 403)
+        self.assertEqual(self.client.get(reverse("dbtool:table_list")).status_code, 403)
+
+    def test_self_deleted_record_restores_with_actor_log(self):
+        self.configure_attendance()
+        TableProfile.objects.filter(table_name="attendance").update(is_released=True)
+        release = ConfigurationEvent.objects.create(
+            schema_name="public", table_name="attendance",
+            action=ConfigurationEvent.Action.RELEASE, is_released=True,
+            visible_fields={"insert": [], "update": []},
+        )
+        row = {"id": 1, "employee_code": "E1", "note": "old"}
+        key = {"id": 1}
+        origin = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.INSERT,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            after_data=encode_row(row), actor=self.user, form_release=release,
+        )
+        origin.record_origin = origin
+        origin.save(update_fields=["record_origin"])
+        deletion = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.DELETE,
+            status=OperationLog.Status.APPLIED, record_key=encode_row(key),
+            before_data=encode_row(row), record_origin=origin, actor=self.user,
+            form_release=release,
+        )
+        owned = ToolOwnedRecord.objects.create(
+            schema_name="public", table_name="attendance", key_digest=key_digest(key),
+            record_key=encode_row(key), fingerprint=row_fingerprint(row),
+            origin=origin, last_operation=deletion, active=False,
+        )
+        service = RollbackService()
+        service.repository.get_row = lambda *args, **kwargs: None
+        service.repository.restore_deleted_row = lambda *args, **kwargs: row
+        with (patch("dbtool.rollback.SchemaIntrospector", return_value=StubIntrospector(self.attendance, self.employee)),
+              patch("dbtool.rollback.transaction.atomic", return_value=nullcontext())):
+            service.restore_deleted(deletion, actor=self.user)
+        owned.refresh_from_db()
+        deletion.refresh_from_db()
+        restore = OperationLog.objects.get(action=OperationLog.Action.RESTORE)
+        self.assertTrue(owned.active)
+        self.assertEqual(owned.last_operation_id, restore.pk)
+        self.assertEqual(restore.record_origin_id, origin.pk)
+        self.assertEqual(restore.actor_id, self.user.pk)
+        self.assertEqual(restore.status, OperationLog.Status.APPLIED)
+        self.assertEqual(deletion.status, OperationLog.Status.ROLLED_BACK)
+
+    def test_restore_rejects_other_users_delete_and_non_delete_actions(self):
+        root = get_user_model().objects.create_superuser(
+            username="restore-root", email="root@example.com", password="password",
+        )
+        operation = OperationLog.objects.create(
+            schema_name="public", table_name="attendance", action=OperationLog.Action.UPDATE,
+            status=OperationLog.Status.APPLIED, actor=self.user,
+        )
+        with self.assertRaises(RollbackNotAllowed):
+            RollbackService().restore_deleted(operation, actor=self.user)
+        operation.action = OperationLog.Action.DELETE
+        operation.record_key = encode_row({"id": 1})
+        operation.actor = root
+        operation.save(update_fields=["action", "record_key", "actor"])
+        with self.assertRaises(RollbackNotAllowed):
+            RollbackService().restore_deleted(operation, actor=self.user)
+        self.assertFalse(OperationLog.objects.filter(action=OperationLog.Action.RESTORE).exists())
 
 
 class SemanticMetadataTests(SemanticFixture, TestCase):
@@ -814,6 +977,7 @@ class DatabaseConfigurationTests(SemanticFixture, TestCase):
             password="password",
             is_staff=True,
         )
+        self.normal_user.groups.add(Group.objects.create(name="dbtool"))
         self.partial = TableDefinition(
             schema="public",
             name="partial",
@@ -921,6 +1085,7 @@ class ReleaseWorkflowTests(SemanticFixture, TestCase):
             password="password",
             is_staff=True,
         )
+        self.normal_user.groups.add(Group.objects.create(name="dbtool"))
         self.introspector = StubIntrospector(
             self.attendance,
             self.employee,
@@ -993,6 +1158,35 @@ class ReleaseWorkflowTests(SemanticFixture, TestCase):
         event = ConfigurationEvent.objects.get(action=ConfigurationEvent.Action.RELEASE)
         self.assertEqual(event.actor, self.superuser)
         self.assertEqual((event.was_released, event.is_released), (False, True))
+        self.assertEqual([field["name"] for field in event.visible_fields["insert"]],
+                         ["employee_code", "note"])
+        self.assertEqual((event.added_fields, event.removed_fields), ([], []))
+
+    def test_form_history_only_exposes_released_field_additions_and_removals(self):
+        self.configure_attendance()
+        self.client.force_login(self.superuser)
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            self.assertEqual(self.client.post(self.release_url).status_code, 302)
+            self.assertEqual(self.client.post(self.unrelease_url).status_code, 302)
+        note = ColumnProfile.objects.get(column_name="note")
+        note.show_in_form = False
+        note.editable = False
+        note.save(update_fields=["show_in_form", "editable"])
+        with patch("dbtool.views.SchemaIntrospector", return_value=self.introspector):
+            self.assertEqual(self.client.post(self.release_url).status_code, 302)
+        event = ConfigurationEvent.objects.filter(action=ConfigurationEvent.Action.RELEASE).latest("pk")
+        self.assertEqual(
+            {(field["form"], field["name"]) for field in event.removed_fields},
+            {("insert", "note"), ("update", "note")},
+        )
+        self.client.force_login(self.normal_user)
+        url = reverse("api_form_history", kwargs={"schema": "public", "table": "attendance"})
+        with patch("dbtool.api.SchemaIntrospector", return_value=self.introspector):
+            releases = self.client.get(url).json()["releases"]
+        self.assertEqual(len(releases), 2)
+        self.assertEqual(releases[0]["added_fields"], [])
+        self.assertEqual(releases[1]["removed_fields"], event.removed_fields)
+        self.assertNotIn("visible_fields", releases[1])
 
     def test_mutations_disabled_blocks_release_even_when_complete(self):
         self.configure_attendance()
@@ -1582,6 +1776,7 @@ class MultiOutputLookupTests(TestCase):
         cls.user = get_user_model().objects.create_user(
             username="mapping-user", password="password", is_staff=True
         )
+        cls.user.groups.add(Group.objects.create(name="dbtool"))
         def column(name, data_type, *, primary_key=False, identity=False):
             return ColumnDefinition(
                 name=name, data_type=data_type, nullable=False, default=None,

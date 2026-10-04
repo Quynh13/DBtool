@@ -5,12 +5,14 @@ from django.contrib.auth import authenticate, login, logout
 from django.core import signing
 from django.core.exceptions import PermissionDenied
 from django.http import Http404, JsonResponse
+from django.db.models import F, OuterRef, Subquery
 from django.shortcuts import render
 from django.views.decorators.csrf import ensure_csrf_cookie
 from django.views.decorators.http import require_GET, require_POST, require_http_methods
 
-from audit.models import OperationLog
+from audit.models import OperationLog, ToolOwnedRecord
 from audit.codec import decode_row, decode_value, encode_row
+from dbtool.access import can_access_record, can_use_tool
 from dbtool.forms import build_row_form
 from dbtool.introspection import SchemaIntrospector
 from dbtool.models import ColumnProfile, ConfigurationEvent
@@ -50,14 +52,14 @@ def session(request):
         user = authenticate(
             request, username=data.get("username"), password=data.get("password")
         )
-        if user is None or not user.is_staff:
+        if user is None or not can_use_tool(user):
             return JsonResponse({"error": "Invalid credentials."}, status=400)
         login(request, user)
     elif request.method == "DELETE":
         logout(request)
     user = request.user
     return JsonResponse({
-        "authenticated": bool(user.is_authenticated and user.is_active and user.is_staff),
+        "authenticated": can_use_tool(user),
         "username": user.get_username() if user.is_authenticated else None,
         "is_superuser": bool(user.is_authenticated and user.is_superuser),
     })
@@ -68,8 +70,8 @@ def staff_required(view):
     def wrapped(request, *args, **kwargs):
         if not request.user.is_authenticated:
             return JsonResponse({"error": "Login required."}, status=401)
-        if not request.user.is_active or not request.user.is_staff:
-            return JsonResponse({"error": "Staff access required."}, status=403)
+        if not can_use_tool(request.user):
+            return JsonResponse({"error": "The dbtool group is required."}, status=403)
         try:
             return view(request, *args, **kwargs)
         except PermissionDenied as exc:
@@ -108,6 +110,31 @@ def table_detail(request, schema, table):
         "can_update": capabilities.can_update,
         "can_delete": capabilities.can_delete,
     })
+
+
+@require_GET
+@staff_required
+def form_history(request, schema, table):
+    definition, effective = _table(request, schema, table)
+    if definition is None:
+        return JsonResponse({"error": "Table not found."}, status=404)
+    if effective is None:
+        return JsonResponse({"error": "Table is not released."}, status=403)
+    releases = ConfigurationEvent.objects.filter(
+        schema_name=schema, table_name=table,
+        action=ConfigurationEvent.Action.RELEASE,
+        visible_fields__isnull=False,
+    ).order_by("created_at", "pk")
+    return JsonResponse({"releases": [
+        {
+            "id": event.pk,
+            "created_at": event.created_at,
+            "added_fields": event.added_fields,
+            "removed_fields": event.removed_fields,
+            "baseline": not bool(event.added_fields or event.removed_fields),
+        }
+        for event in releases
+    ]})
 
 
 def _table(request, schema, table):
@@ -185,17 +212,45 @@ def row_add(request, schema, table):
     return JsonResponse({"ok": True})
 
 
-def _owned_row(schema, table, row_token):
+def _owned_row(schema, table, row_token, user):
     try:
         record_key = load_row_token(row_token)
     except signing.BadSignature:
         return None, None
-    if owned_record(schema, table, record_key) is None:
+    if not can_access_record(user, owned_record(schema, table, record_key)):
         return None, None
     row = GenericTableRepository().get_row(schema, table, record_key)
     if row is None or verified_owned_record(schema, table, record_key, row) is None:
         return None, None
     return record_key, row
+
+
+def _record_history(origin, *, root):
+    operations = OperationLog.objects.filter(record_origin=origin).select_related(
+        "actor"
+    ).order_by("created_at", "pk")
+    return [
+        {
+            "id": str(item.pk) if root else None,
+            "action": item.action,
+            "status": item.status,
+            "created_at": item.created_at,
+            "actor": item.actor.get_username() if item.actor else None,
+            "changes": [
+                {
+                    "column": name,
+                    "before": _display_value(decode_value(before[name])) if name in before else "—",
+                    "after": _display_value(decode_value(after[name])) if name in after else "—",
+                }
+                for name in sorted(before.keys() | after.keys())
+                if before.get(name) != after.get(name)
+            ],
+        }
+        for item in operations
+        for before, after in [(item.before_data or {}, item.after_data or {})]
+        if item.status in {OperationLog.Status.APPLIED, OperationLog.Status.ROLLED_BACK,
+                           OperationLog.Status.ROLLBACK_FAILED}
+    ]
 
 
 @require_GET
@@ -206,7 +261,7 @@ def row_detail(request, schema, table, row_token):
         return JsonResponse({"error": "Table not found."}, status=404)
     if effective is None:
         return JsonResponse({"error": "Table is not released."}, status=403)
-    record_key, current = _owned_row(schema, table, row_token)
+    record_key, current = _owned_row(schema, table, row_token, request.user)
     if current is None:
         return JsonResponse({"error": "Managed row not found."}, status=404)
     result = {
@@ -214,33 +269,96 @@ def row_detail(request, schema, table, row_token):
         "can_update": effective.capabilities.can_update,
         "can_delete": effective.capabilities.can_delete,
     }
-    if request.user.is_superuser:
-        owner = owned_record(schema, table, record_key)
-        operations = OperationLog.objects.filter(
-            schema_name=schema, table_name=table, record_key=encode_row(record_key),
-            created_at__gte=owner.origin.created_at,
-        ).select_related("actor").order_by("created_at", "pk")
-        result["history"] = [
-            {
-                "id": str(item.pk),
-                "action": item.action,
-                "status": item.status,
-                "created_at": item.created_at,
-                "actor": item.actor.get_username() if item.actor else None,
-                "changes": [
-                    {
-                        "column": name,
-                        "before": _display_value(decode_value(before[name])) if name in before else "—",
-                        "after": _display_value(decode_value(after[name])) if name in after else "—",
-                    }
-                    for name in sorted(before.keys() | after.keys())
-                    if before.get(name) != after.get(name)
-                ],
-            }
-            for item in operations
-            for before, after in [(item.before_data or {}, item.after_data or {})]
-        ]
+    owner = owned_record(schema, table, record_key)
+    if not can_access_record(request.user, owner):
+        return JsonResponse({"error": "Managed row not found."}, status=404)
+    result["created_form_release"] = (
+        owner.origin.form_release.created_at
+        if owner.origin.form_release_id else None
+    )
+    result["history"] = _record_history(owner.origin, root=request.user.is_superuser)
     return JsonResponse(result)
+
+
+def _deleted_origins(user):
+    latest = OperationLog.objects.filter(
+        record_origin_id=OuterRef("pk"),
+        status__in=[OperationLog.Status.APPLIED, OperationLog.Status.ROLLED_BACK,
+                    OperationLog.Status.ROLLBACK_FAILED],
+    ).order_by("-created_at", "-pk")
+    origins = OperationLog.objects.filter(
+        action=OperationLog.Action.INSERT, status=OperationLog.Status.APPLIED,
+        record_origin_id=F("pk"),
+    ).annotate(
+        latest_action=Subquery(latest.values("action")[:1]),
+        latest_status=Subquery(latest.values("status")[:1]),
+    ).filter(latest_action=OperationLog.Action.DELETE,
+             latest_status__in=[OperationLog.Status.APPLIED,
+                                OperationLog.Status.ROLLBACK_FAILED])
+    if not user.is_superuser:
+        origins = origins.filter(actor_id=user.pk)
+    return origins
+
+
+@require_GET
+@staff_required
+def deleted_records(request):
+    return JsonResponse({"records": [
+        {
+            "origin_id": str(origin.pk),
+            "schema": origin.schema_name,
+            "table": origin.table_name,
+            "record_key": origin.record_key,
+            "created_at": origin.created_at,
+        }
+        for origin in _deleted_origins(request.user).order_by("-created_at")
+    ]})
+
+
+@require_GET
+@staff_required
+def deleted_record_detail(request, origin_id):
+    origin = _deleted_origins(request.user).filter(pk=origin_id).first()
+    if origin is None:
+        return JsonResponse({"error": "Deleted record not found."}, status=404)
+    deletion = OperationLog.objects.filter(
+        record_origin=origin, action=OperationLog.Action.DELETE,
+        status__in=[OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED],
+    ).order_by("-created_at", "-pk").first()
+    key = decode_row(origin.record_key)
+    owned = ToolOwnedRecord.objects.filter(
+        schema_name=origin.schema_name, table_name=origin.table_name,
+        record_key=origin.record_key, origin=origin, active=False,
+        last_operation=deletion,
+    ).first()
+    return JsonResponse({
+        "schema": origin.schema_name,
+        "table": origin.table_name,
+        "record_key": {name: _display_value(value) for name, value in key.items()},
+        "history": _record_history(origin, root=request.user.is_superuser),
+        "can_restore": bool(
+            owned and (request.user.is_superuser or deletion.actor_id == request.user.pk)
+        ),
+    })
+
+
+@require_POST
+@staff_required
+def deleted_record_restore(request, origin_id):
+    origin = _deleted_origins(request.user).filter(pk=origin_id).first()
+    if origin is None:
+        return JsonResponse({"error": "Deleted record not found."}, status=404)
+    deletion = OperationLog.objects.filter(
+        record_origin=origin, action=OperationLog.Action.DELETE,
+        status__in=[OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED],
+    ).order_by("-created_at", "-pk").first()
+    if not request.user.is_superuser and deletion.actor_id != request.user.pk:
+        return JsonResponse({"error": "Only your own deletion can be restored."}, status=403)
+    try:
+        RollbackService().restore_deleted(deletion, actor=request.user)
+    except Exception as exc:
+        return JsonResponse({"error": f"Restore blocked: {exc}"}, status=409)
+    return JsonResponse({"ok": True})
 
 
 @require_http_methods(["GET", "POST"])
@@ -253,7 +371,7 @@ def row_edit(request, schema, table, row_token):
         return JsonResponse({"error": "Table is not released."}, status=403)
     if not effective.capabilities.can_update:
         return JsonResponse({"error": "UPDATE is not allowed."}, status=403)
-    record_key, current = _owned_row(schema, table, row_token)
+    record_key, current = _owned_row(schema, table, row_token, request.user)
     if current is None:
         return JsonResponse({"error": "Managed row not found."}, status=404)
     form_class = build_row_form(effective, mode="update")
@@ -302,7 +420,7 @@ def row_delete(request, schema, table, row_token):
         return JsonResponse({"error": "Table is not released."}, status=403)
     if not effective.capabilities.can_delete:
         return JsonResponse({"error": "DELETE is not allowed."}, status=403)
-    record_key, current = _owned_row(schema, table, row_token)
+    record_key, current = _owned_row(schema, table, row_token, request.user)
     if current is None:
         return JsonResponse({"error": "Managed row not found."}, status=404)
     if request.method == "GET":
@@ -417,7 +535,7 @@ def operation_detail(request, operation_id):
     record_key = decode_row(item.record_key) if item.record_key else None
     owner = owned_record(item.schema_name, item.table_name, record_key) if record_key else None
     record_token = None
-    if owner and item.created_at >= owner.origin.created_at:
+    if owner and item.record_origin_id == owner.origin_id:
         try:
             current = GenericTableRepository().get_row(item.schema_name, item.table_name, record_key)
             if current is not None and verified_owned_record(item.schema_name, item.table_name, record_key, current):
@@ -438,7 +556,10 @@ def operation_detail(request, operation_id):
         "after_data": item.after_data,
         "error_message": item.error_message,
         "rolled_back_at": item.rolled_back_at,
-        "can_rollback": item.status in {OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED},
+        "can_rollback": (
+            item.action == OperationLog.Action.DELETE
+            and item.status in {OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED}
+        ),
     })
 
 
@@ -450,10 +571,12 @@ def operation_rollback(request, operation_id):
         item = OperationLog.objects.get(pk=operation_id)
     except OperationLog.DoesNotExist:
         return JsonResponse({"error": "Operation not found."}, status=404)
-    if item.status not in {OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED}:
+    if item.action != OperationLog.Action.DELETE or item.status not in {
+        OperationLog.Status.APPLIED, OperationLog.Status.ROLLBACK_FAILED,
+    }:
         return JsonResponse({"error": "This operation cannot be rolled back."}, status=403)
     try:
-        RollbackService().rollback(item)
+        RollbackService().restore_deleted(item, actor=request.user)
     except Exception as exc:
         return JsonResponse({"error": f"Rollback blocked: {exc}"}, status=409)
     return JsonResponse({"ok": True})

@@ -2,65 +2,70 @@ from django.contrib import admin
 from django.urls import path
 
 from dbtool import views
+from dbtool.access import tool_access_required
 
 
 app_name = "dbtool"
 
 
+def editor_view(view):
+    return admin.site.admin_view(tool_access_required(view))
+
+
 urlpatterns = [
     path(
         "",
-        admin.site.admin_view(views.table_list),
+        editor_view(views.table_list),
         name="table_list",
     ),
     path(
         "configuration/",
-        admin.site.admin_view(views.database_configuration),
+        editor_view(views.database_configuration),
         name="database_configuration",
     ),
     path(
         "configuration/<str:schema>/<str:table>/release/",
-        admin.site.admin_view(views.table_release),
+        editor_view(views.table_release),
         name="table_release",
     ),
     path(
         "configuration/<str:schema>/<str:table>/unrelease/",
-        admin.site.admin_view(views.table_unrelease),
+        editor_view(views.table_unrelease),
         name="table_unrelease",
     ),
     path(
         "<str:schema>/<str:table>/add/",
-        admin.site.admin_view(views.row_add),
+        editor_view(views.row_add),
         name="row_add",
     ),
     path(
         "<str:schema>/<str:table>/review/",
-        admin.site.admin_view(views.table_review),
+        editor_view(views.table_review),
         name="table_review",
     ),
     path(
         "<str:schema>/<str:table>/lookup/<str:column>/",
-        admin.site.admin_view(views.lookup_search),
+        editor_view(views.lookup_search),
         name="lookup_search",
     ),
     path(
         "<str:schema>/<str:table>/row/<str:row_token>/edit/",
-        admin.site.admin_view(views.row_edit),
+        editor_view(views.row_edit),
         name="row_edit",
     ),
     path(
         "<str:schema>/<str:table>/row/<str:row_token>/delete/",
-        admin.site.admin_view(views.row_delete),
+        editor_view(views.row_delete),
         name="row_delete",
     ),
     path(
         "operation/<uuid:operation_id>/rollback/",
-        admin.site.admin_view(views.operation_rollback),
+        editor_view(views.operation_rollback),
         name="operation_rollback",
     ),
     path(
         "<str:schema>/<str:table>/",
-        admin.site.admin_view(views.table_detail),
+        editor_view(views.table_detail),
         name="table_detail",
     ),
 ]

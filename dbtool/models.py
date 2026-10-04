@@ -106,6 +106,9 @@ class ConfigurationEvent(models.Model):
     )
     was_released = models.BooleanField(default=False)
     is_released = models.BooleanField(default=False)
+    visible_fields = models.JSONField(null=True, blank=True)
+    added_fields = models.JSONField(default=list, blank=True)
+    removed_fields = models.JSONField(default=list, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:

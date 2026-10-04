@@ -9,6 +9,7 @@ class OperationLog(models.Model):
         INSERT = "INSERT", "Insert"
         UPDATE = "UPDATE", "Update"
         DELETE = "DELETE", "Delete"
+        RESTORE = "RESTORE", "Restore"
 
     class Status(models.TextChoices):
         PENDING = "PENDING", "Pending"
@@ -36,6 +37,14 @@ class OperationLog(models.Model):
     record_key = models.JSONField(
         null=True,
         blank=True,
+    )
+    record_origin = models.ForeignKey(
+        "self", null=True, blank=True, on_delete=models.PROTECT,
+        related_name="record_history",
+    )
+    form_release = models.ForeignKey(
+        "dbtool.ConfigurationEvent", null=True, blank=True,
+        on_delete=models.PROTECT, related_name="record_operations",
     )
 
     # Complete row snapshots.

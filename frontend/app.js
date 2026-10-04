@@ -83,6 +83,7 @@ async function showTable(schema, name) {
   node('p', `${data.status} · ${data.total_rows} tool-owned row(s)`, main);
   const route = `#/tables/${encodeURIComponent(schema)}/${encodeURIComponent(name)}`;
   if (data.can_insert) link('Add row', `${route}/add`, main);
+  link('Form history', `${route}/form-history`, main);
   const rows = data.rows.map((row) => {
     const actions = node('span');
     if (row.row_token) link('Details', `${route}/rows/${encodeURIComponent(row.row_token)}`, actions);
@@ -107,6 +108,7 @@ async function showRowDetail(schema, name, token) {
   const data = await api(`tables/${encodeURIComponent(schema)}/${encodeURIComponent(name)}/rows/${encodeURIComponent(token)}/`);
   link('Back to table', route, main);
   node('h2', `Record: ${schema}.${name}`, main);
+  node('p', `Created under form release: ${data.created_form_release || 'Unknown (before form history)'}`, main);
   table(['Column', 'Value'], Object.entries(data.values), main);
   if (data.can_update) link('Edit', `${rowRoute}/edit`, main);
   if (data.can_delete) link('Delete', `${rowRoute}/delete`, main);
@@ -115,8 +117,61 @@ async function showRowDetail(schema, name, token) {
     table(['Time', 'Action', 'Status', 'Actor', 'Changes', 'Log'], data.history.map((item) => [
       item.created_at, item.action, item.status, item.actor || 'unknown',
       item.changes.map((change) => `${change.column}: ${change.before} → ${change.after}`).join('; '),
-      link('View', `#/operations/${item.id}`),
+      item.id ? link('View', `#/operations/${item.id}`) : '',
     ]), main);
+  }
+}
+
+async function showFormHistory(schema, name) {
+  const route = `#/tables/${encodeURIComponent(schema)}/${encodeURIComponent(name)}`;
+  const data = await api(`tables/${encodeURIComponent(schema)}/${encodeURIComponent(name)}/form-history/`);
+  link('Back to table', route, main);
+  node('h2', `Form history: ${schema}.${name}`, main);
+  if (!data.releases.length) return node('p', 'No recorded form release yet.', main);
+  table(['Released at', 'Fields added', 'Fields removed'], data.releases.map((release) => [
+    release.created_at,
+    release.added_fields.map((field) => `${field.form}: ${field.label}`).join('; ') || '—',
+    release.removed_fields.map((field) => `${field.form}: ${field.label}`).join('; ') || '—',
+  ]), main);
+}
+
+async function showDeletedRecords() {
+  const { records } = await api('deleted-records/');
+  node('h2', 'Deleted records', main);
+  table(['Created at', 'Table', 'Record key', 'Action'], records.map((record) => [
+    record.created_at, `${record.schema}.${record.table}`, JSON.stringify(record.record_key),
+    link('History', `#/deleted-records/${record.origin_id}`),
+  ]), main);
+}
+
+async function showDeletedRecord(originId) {
+  const data = await api(`deleted-records/${encodeURIComponent(originId)}/`);
+  link('Back to deleted records', '#/deleted-records', main);
+  node('h2', `Deleted record: ${data.schema}.${data.table}`, main);
+  table(['Key', 'Value'], Object.entries(data.record_key), main);
+  node('h3', 'Record history', main);
+  table(['Time', 'Action', 'Status', 'Actor', 'Changes', 'Log'], data.history.map((item) => [
+    item.created_at, item.action, item.status, item.actor || 'unknown',
+    item.changes.map((change) => `${change.column}: ${change.before} → ${change.after}`).join('; '),
+    item.id ? link('View', `#/operations/${item.id}`) : '',
+  ]), main);
+  if (data.can_restore) {
+    const button = node('button', 'Restore deleted record', main);
+    button.addEventListener('click', async () => {
+      if (button.dataset.confirm !== 'yes') {
+        button.dataset.confirm = 'yes';
+        button.textContent = 'Confirm restore';
+        return;
+      }
+      button.disabled = true;
+      try {
+        await api(`deleted-records/${encodeURIComponent(originId)}/restore/`, { method: 'POST' });
+        location.hash = `#/tables/${encodeURIComponent(data.schema)}/${encodeURIComponent(data.table)}`;
+      } catch (exception) {
+        button.disabled = false;
+        error(exception.message);
+      }
+    });
   }
 }
 
@@ -238,6 +293,7 @@ async function show() {
   nav.replaceChildren();
   if (!session.authenticated) return loginScreen();
   link('Database Editor', '#/', nav);
+  link('Deleted records', '#/deleted-records', nav);
   if (session.is_superuser) link('Database Configuration', '#/configuration', nav);
   if (session.is_superuser) link('Operation Logs', '#/operations', nav);
   const signOut = node('button', 'Sign out', nav);
@@ -248,11 +304,16 @@ async function show() {
   main.replaceChildren();
   try {
     if (location.hash === '#/configuration') return await showConfiguration(main);
+    if (location.hash === '#/deleted-records') return await showDeletedRecords();
+    const deleted = location.hash.match(/^#\/deleted-records\/([0-9a-f-]+)$/);
+    if (deleted) return await showDeletedRecord(deleted[1]);
     const review = location.hash.match(/^#\/configuration\/([^/?]+)\/([^/?]+)/);
     if (review) return await showReview(main, decodeURIComponent(review[1]), decodeURIComponent(review[2]));
     if (location.hash.startsWith('#/operations?') || location.hash === '#/operations') return await showLogs(main);
     const operation = location.hash.match(/^#\/operations\/([0-9a-f-]+)$/);
     if (operation) return await showOperation(main, operation[1]);
+    const formHistory = location.hash.match(/^#\/tables\/([^/?]+)\/([^/?]+)\/form-history$/);
+    if (formHistory) return await showFormHistory(decodeURIComponent(formHistory[1]), decodeURIComponent(formHistory[2]));
     const match = location.hash.match(/^#\/tables\/([^/?]+)\/([^/?]+)(?:\/rows\/([^/?]+)(?:\/(edit|delete))?|\/(add))?/);
     if (match) {
       const schema = decodeURIComponent(match[1]);

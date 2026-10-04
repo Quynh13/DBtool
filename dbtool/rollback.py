@@ -6,9 +6,13 @@ from audit.codec import (
     encode_row,
 )
 from audit.models import OperationLog, ToolOwnedRecord
+from dbtool.access import can_access_record, can_use_tool
+from dbtool.introspection import SchemaIntrospector
+from dbtool.models import ConfigurationEvent
 from dbtool.ownership import key_digest, owned_record
 from dbtool.row_state import row_fingerprint
 from dbtool.repository import GenericTableRepository
+from dbtool.semantics import EffectiveMetadataService
 
 
 class RollbackNotAllowed(Exception):
@@ -30,9 +34,50 @@ class RollbackService:
     def __init__(self):
         self.repository = GenericTableRepository()
 
+    def restore_deleted(self, operation: OperationLog, *, actor):
+        if operation.action != OperationLog.Action.DELETE:
+            raise RollbackNotAllowed("Only deleted records can be restored.")
+        if not can_use_tool(actor):
+            raise RollbackNotAllowed("Tool access is required.")
+        record_key = decode_row(operation.record_key)
+        if not record_key or not operation.record_origin_id:
+            raise RollbackNotAllowed("Record ownership could not be verified.")
+        owned = ToolOwnedRecord.objects.filter(
+            schema_name=operation.schema_name,
+            table_name=operation.table_name,
+            key_digest=key_digest(record_key),
+            active=False,
+            origin_id=operation.record_origin_id,
+            last_operation_id=operation.pk,
+        ).select_related("origin").first()
+        if not can_access_record(actor, owned):
+            raise RollbackNotAllowed("Record ownership could not be verified.")
+        if not actor.is_superuser and operation.actor_id != actor.pk:
+            raise RollbackNotAllowed("Only your own deletion can be restored.")
+        release = ConfigurationEvent.objects.filter(
+            schema_name=operation.schema_name,
+            table_name=operation.table_name,
+            action=ConfigurationEvent.Action.RELEASE,
+            visible_fields__isnull=False,
+        ).order_by("-pk").first()
+        if release is None or operation.form_release_id != release.pk:
+            raise RollbackNotAllowed("The form has changed since deletion; restore is blocked.")
+        introspector = SchemaIntrospector()
+        try:
+            definition = introspector.inspect_table(operation.schema_name, operation.table_name)
+        except ValueError as exc:
+            raise RollbackNotAllowed("The table no longer exists.") from exc
+        effective = EffectiveMetadataService(introspector=introspector).resolve(definition)
+        if not effective.capabilities.can_insert:
+            raise RollbackNotAllowed("The table is not released and safe for restore.")
+        self.rollback(operation, actor=actor, form_release=release)
+
     def rollback(
         self,
         operation: OperationLog,
+        *,
+        actor=None,
+        form_release=None,
     ):
         if operation.status not in {
             OperationLog.Status.APPLIED,
@@ -58,6 +103,21 @@ class RollbackService:
             raise RollbackNotAllowed("A later operation changed this record.")
         if operation.action == OperationLog.Action.INSERT and owned.origin_id != operation.id:
             raise RollbackNotAllowed("This INSERT no longer owns the current record.")
+
+        restore_intent = None
+        if actor is not None:
+            if operation.action != OperationLog.Action.DELETE:
+                raise RollbackNotAllowed("Only deleted records can be restored.")
+            restore_intent = OperationLog.objects.create(
+                schema_name=operation.schema_name,
+                table_name=operation.table_name,
+                action=OperationLog.Action.RESTORE,
+                record_key=operation.record_key,
+                record_origin=owned.origin,
+                form_release=form_release,
+                after_data=operation.before_data,
+                actor=actor,
+            )
 
         operation.status = OperationLog.Status.ROLLBACK_PENDING
 
@@ -94,6 +154,10 @@ class RollbackService:
                     "error_message",
                 ]
             )
+            if restore_intent:
+                restore_intent.status = OperationLog.Status.FAILED
+                restore_intent.error_message = str(exc)[:4000]
+                restore_intent.save(update_fields=["status", "error_message"])
 
             raise
 
@@ -111,13 +175,16 @@ class RollbackService:
             elif operation.action == OperationLog.Action.DELETE:
                 owned.active = True
                 owned.fingerprint = row_fingerprint(decode_row(operation.before_data))
-                owned.last_operation = operation
+                owned.last_operation = restore_intent or operation
                 owned.save(update_fields=["active", "fingerprint", "last_operation"])
             elif operation.action == OperationLog.Action.UPDATE:
                 owned.fingerprint = row_fingerprint(decode_row(operation.before_data))
                 owned.last_operation = operation
                 owned.save(update_fields=["fingerprint", "last_operation"])
             operation.save(update_fields=["status", "rolled_back_at", "error_message"])
+            if restore_intent:
+                restore_intent.status = OperationLog.Status.APPLIED
+                restore_intent.save(update_fields=["status"])
 
     def _rollback_insert(
         self,

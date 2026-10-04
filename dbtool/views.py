@@ -52,6 +52,7 @@ from django.views.decorators.http import require_POST
 from audit.models import OperationLog, ToolOwnedRecord
 from audit.codec import decode_row
 from dbtool.ownership import key_digest, owned_record, verified_owned_record
+from dbtool.access import can_access_record
 from dbtool.row_state import row_fingerprint
 from dbtool.rollback import (
     RollbackNotAllowed,
@@ -400,6 +401,8 @@ def table_detail_context(request, schema, table):
     owned = ToolOwnedRecord.objects.filter(
         schema_name=schema, table_name=table, active=True
     ).order_by("pk")
+    if not request.user.is_superuser:
+        owned = owned.filter(origin__actor_id=request.user.pk)
     total_rows = owned.count()
 
     total_pages = max(
@@ -691,6 +694,34 @@ def table_review(request, schema, table):
     return render(request, "dbtool/table_review.html", context)
 
 
+def _visible_form_fields(effective):
+    return {
+        mode: [
+            {"name": name, "label": field.label}
+            for name, field in build_row_form(effective, mode=mode).base_fields.items()
+        ]
+        for mode in ("insert", "update")
+    }
+
+
+def _form_field_changes(previous, current):
+    added, removed = [], []
+    if previous is None:
+        return added, removed
+    for mode in ("insert", "update"):
+        old = {item["name"]: item["label"] for item in previous.get(mode, [])}
+        new = {item["name"]: item["label"] for item in current[mode]}
+        added.extend(
+            {"form": mode, "name": name, "label": label}
+            for name, label in new.items() if name not in old
+        )
+        removed.extend(
+            {"form": mode, "name": name, "label": label}
+            for name, label in old.items() if name not in new
+        )
+    return added, removed
+
+
 @require_POST
 def table_release(request, schema, table):
     if not request.user.is_superuser:
@@ -710,8 +741,16 @@ def table_release(request, schema, table):
             raise PermissionDenied(
                 "Only complete, mutation-enabled, unreleased table configuration can be released."
             )
+        previous = ConfigurationEvent.objects.filter(
+            schema_name=schema, table_name=table,
+            action=ConfigurationEvent.Action.RELEASE,
+            visible_fields__isnull=False,
+        ).order_by("-pk").first()
         effective.profile.is_released = True
         effective.profile.save(update_fields=["is_released"])
+        released_effective = EffectiveMetadataService(introspector=introspector).resolve(definition)
+        fields = _visible_form_fields(released_effective)
+        added, removed = _form_field_changes(previous.visible_fields if previous else None, fields)
         ConfigurationEvent.objects.create(
             schema_name=schema,
             table_name=table,
@@ -719,6 +758,9 @@ def table_release(request, schema, table):
             actor=request.user,
             was_released=False,
             is_released=True,
+            visible_fields=fields,
+            added_fields=added,
+            removed_fields=removed,
         )
     messages.success(request, f"{schema}.{table} released.")
     if request.path.startswith("/api/"):
@@ -881,7 +923,7 @@ def row_edit(
 
     record_key = _load_record_key(row_token)
 
-    if owned_record(schema, table, record_key) is None:
+    if not can_access_record(request.user, owned_record(schema, table, record_key)):
         raise Http404("Row is not managed by this tool.")
 
     current = repository.get_row(
@@ -1035,7 +1077,7 @@ def row_delete(
 
     record_key = _load_record_key(row_token)
 
-    if owned_record(schema, table, record_key) is None:
+    if not can_access_record(request.user, owned_record(schema, table, record_key)):
         raise Http404("Row is not managed by this tool.")
 
     current = repository.get_row(
@@ -1160,12 +1202,14 @@ def operation_rollback(
     request,
     operation_id,
 ):
+    if not request.user.is_superuser:
+        raise PermissionDenied("Only a superuser can restore deleted records.")
     operation = get_object_or_404(
         OperationLog,
         pk=operation_id,
     )
 
-    allowed = operation.status in {
+    allowed = operation.action == OperationLog.Action.DELETE and operation.status in {
         OperationLog.Status.APPLIED,
         OperationLog.Status.ROLLBACK_FAILED,
     }
@@ -1175,7 +1219,7 @@ def operation_rollback(
 
     if request.method == "POST":
         try:
-            RollbackService().rollback(operation)
+            RollbackService().restore_deleted(operation, actor=request.user)
 
         except Exception as exc:
             messages.error(
