@@ -85,7 +85,9 @@ function mappingEditor(parent, prefix, values, sourceColumns, destinationColumns
   add.type = 'button';
   function addRow(source = '', destination = '') {
     const row = node('div', null, rows);
-    const sourceSelect = select(row, '', 'Source', sourceColumns, source);
+    const columns = sourceColumns();
+    const sourceSelect = select(row, '', 'Source', ['', ...columns], columns.includes(source) ? source : '');
+    sourceSelect.options[0].text = 'Select source column';
     const destinationSelect = select(row, '', 'Destination', destinationColumns, destination);
     const remove = node('button', 'Remove', row);
     remove.type = 'button';
@@ -103,7 +105,12 @@ function mappingEditor(parent, prefix, values, sourceColumns, destinationColumns
   hidden.name = `${prefix}-output_mappings`;
   return {
     refresh(columns) {
-      for (const row of rows.children) replaceOptions(row.querySelector('select'), columns, row.querySelector('select').value);
+      for (const row of rows.children) {
+        const sourceSelect = row.querySelector('select');
+        const previous = sourceSelect.value;
+        replaceOptions(sourceSelect, ['', ...columns], columns.includes(previous) ? previous : '');
+        sourceSelect.options[0].text = 'Select source column';
+      }
     },
     collect() {
       hidden.value = JSON.stringify([...rows.children].map((row) => ({
@@ -184,7 +191,7 @@ export async function showReview(main, schema, table, provided) {
     const searchSelect = select(lookup, `${prefix}-search_columns`, 'Search columns', sourceColumns(), values.search_columns, true);
     input(lookup, `${prefix}-allow_null`, 'Allow null', values.allow_null, 'checkbox');
     input(lookup, `${prefix}-allow_arbitrary_value`, 'Allow arbitrary value', values.allow_arbitrary_value, 'checkbox');
-    const mapping = mappingEditor(lookup, prefix, values.output_mappings, sourceColumns(), data.columns.map((item) => item.name));
+    const mapping = mappingEditor(lookup, prefix, values.output_mappings, sourceColumns, data.columns.map((item) => item.name));
     mappings.push(mapping);
     function refreshTables() {
       replaceOptions(tableSelect, Object.keys(data.catalog[schemaSelect.value] || {}).sort(), tableSelect.value);
