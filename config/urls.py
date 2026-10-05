@@ -1,10 +1,12 @@
 from django.contrib import admin
 from django.urls import include, path
+from django.views.generic import RedirectView
 
 from dbtool import api
 
 
 urlpatterns = [
+    path("", RedirectView.as_view(pattern_name="frontend", permanent=False)),
     path("app/", api.frontend, name="frontend"),
     path("api/v1/session/", api.session, name="api_session"),
     path("api/v1/tables/", api.table_list, name="api_table_list"),

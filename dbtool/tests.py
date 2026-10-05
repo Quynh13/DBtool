@@ -42,6 +42,12 @@ from dbtool.safety import SafetyPolicy
 
 
 class UrlRoutingTests(SimpleTestCase):
+    def test_site_root_redirects_to_frontend(self):
+        response = self.client.get("/")
+
+        self.assertEqual(response.status_code, 302)
+        self.assertEqual(response["Location"], reverse("frontend"))
+
     def test_admin_model_urls_do_not_collide_with_generic_editor(self):
         admin_url = reverse("admin:dbtool_tableprofile_add")
 
