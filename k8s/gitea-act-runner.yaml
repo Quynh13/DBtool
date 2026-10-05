@@ -1,0 +1,100 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: gitea-runner
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: gitea-runner-sa
+  namespace: gitea-runner
+---
+# Cấp quyền cho Runner deploy vào namespace sac-tool
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: gitea-runner-deployer
+rules:
+  - apiGroups: ["", "apps", "networking.k8s.io"]
+    resources:
+      - deployments
+      - pods
+      - services
+      - configmaps
+      - secrets
+      - ingresses
+      - persistentvolumeclaims
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: gitea-runner-deployer-binding
+subjects:
+  - kind: ServiceAccount
+    name: gitea-runner-sa
+    namespace: gitea-runner
+roleRef:
+  kind: ClusterRole
+  name: gitea-runner-deployer
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: act-runner
+  namespace: gitea-runner
+  labels:
+    app: act-runner
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: act-runner
+  template:
+    metadata:
+      labels:
+        app: act-runner
+    spec:
+      serviceAccountName: gitea-runner-sa
+      containers:
+        # Sidecar Docker daemon để hỗ trợ build Docker image bên trong K3s
+        - name: dind
+          image: docker:24-dind
+          securityContext:
+            privileged: true
+          env:
+            - name: DOCKER_TLS_CERTDIR
+              value: ""
+          volumeMounts:
+            - name: docker-storage
+              mountPath: /var/lib/docker
+            - name: docker-sock
+              mountPath: /var/run
+
+        # Act Runner kết nối với Gitea Server
+        - name: runner
+          image: gitea/act_runner:latest
+          env:
+            - name: GITEA_INSTANCE_URL
+              value: "http://<GITEA_SERVER_IP_OR_DOMAIN>" # Đổi thành URL Gitea của bạn
+            - name: GITEA_RUNNER_REGISTRATION_TOKEN
+              value: "<YOUR_RUNNER_REGISTRATION_TOKEN>"   # Lấy từ Gitea Admin hoặc Repo Settings -> Actions -> Runners
+            - name: GITEA_RUNNER_NAME
+              value: "k3s-act-runner"
+            - name: GITEA_RUNNER_LABELS
+              value: "ubuntu-latest:docker://catthehacker/ubuntu:act-latest,k3s:docker://catthehacker/ubuntu:act-latest"
+            - name: DOCKER_HOST
+              value: "unix:///var/run/docker.sock"
+          volumeMounts:
+            - name: docker-sock
+              mountPath: /var/run
+            - name: runner-data
+              mountPath: /data
+      volumes:
+        - name: docker-sock
+          emptyDir: {}
+        - name: docker-storage
+          emptyDir: {}
+        - name: runner-data
+          emptyDir: {}
