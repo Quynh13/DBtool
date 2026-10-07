@@ -482,6 +482,12 @@ class FrontendBootstrapTests(SemanticFixture, TestCase):
         self.assertContains(response, "Database Editor")
         self.assertIn("csrftoken", response.cookies)
 
+    def test_db_debug_placeholder_requires_tool_access(self):
+        self.assertEqual(reverse("db_debug"), "/db-debug")
+        self.assertEqual(self.client.get(reverse("db_debug")).status_code, 403)
+        self.client.force_login(self.user)
+        self.assertContains(self.client.get(reverse("db_debug")), "DB Debug")
+
     def test_session_login_and_logout(self):
         import json
 

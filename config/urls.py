@@ -8,6 +8,7 @@ from dbtool import api
 urlpatterns = [
     path("", RedirectView.as_view(pattern_name="frontend", permanent=False)),
     path("app/", api.frontend, name="frontend"),
+    path("db-debug", api.db_debug, name="db_debug"),
     path("api/v1/session/", api.session, name="api_session"),
     path("api/v1/tables/", api.table_list, name="api_table_list"),
     path("api/v1/tables/<str:schema>/<str:table>/", api.table_detail, name="api_table_detail"),

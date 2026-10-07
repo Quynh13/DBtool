@@ -65,6 +65,8 @@ function loginScreen() {
 }
 
 async function showTables() {
+  const debugButton = node('button', 'DB Debug', main);
+  debugButton.addEventListener('click', () => { location.href = '/db-debug'; });
   const { tables } = await api('tables/');
   node('h2', 'Released tables', main);
   if (!tables.length) return node('p', 'No released tables.', main);

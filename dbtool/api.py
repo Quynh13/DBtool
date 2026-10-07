@@ -12,7 +12,7 @@ from django.views.decorators.http import require_GET, require_POST, require_http
 
 from audit.models import OperationLog, ToolOwnedRecord
 from audit.codec import decode_row, decode_value, encode_row
-from dbtool.access import can_access_record, can_use_tool
+from dbtool.access import can_access_record, can_use_tool, tool_access_required
 from dbtool.forms import build_row_form
 from dbtool.introspection import SchemaIntrospector
 from dbtool.models import ColumnProfile, ConfigurationEvent
@@ -38,6 +38,12 @@ from dbtool.views import (
 @ensure_csrf_cookie
 def frontend(request):
     return render(request, "index.html")
+
+
+@require_GET
+@tool_access_required
+def db_debug(request):
+    return render(request, "dbtool/db_debug.html")
 
 
 @require_http_methods(["GET", "POST", "DELETE"])
